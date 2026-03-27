@@ -28,6 +28,6 @@ echo 正在打包 ai_mb.exe ...
 pyinstaller --noconsole --onefile --icon=logo.ico -n "ai_mb" template_tool.py
 
 echo ==========================================
-echo   打包全部完成！
+echo   打包全部完成！1
 echo ==========================================
 pause

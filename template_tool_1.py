@@ -16,10 +16,12 @@ from PyQt6.QtWidgets import (
     QStatusBar, QMessageBox, QSlider, QListWidget, QListWidgetItem,
     QProgressBar, QScrollArea, QAbstractItemView, QDoubleSpinBox
 )
-from PyQt6.QtCore  import Qt, QThread, pyqtSignal
+from PyQt6.QtCore  import Qt, QThread, pyqtSignal, QSettings
 from PyQt6.QtGui   import QPixmap, QImage, QCursor, QColor, QPalette
 
 log = logging.getLogger(__name__)
+APP_ORG  = "Ralo"
+APP_NAME = "FrameComposer"
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
 # ─────────────────────────────────────────────────────────────
@@ -34,9 +36,6 @@ QWidget {
     font-size: 13px; background: transparent;
 }
 QWidget#root { background: #111113; }
-
-/* 底部包裹区域，用 ID 绑定，防止样式穿透覆盖按钮 */
-QWidget#botArea { background: transparent; }
 
 /* 分区标题 */
 QLabel#sec {
@@ -95,43 +94,18 @@ QProgressBar::chunk {
     border-radius: 2px;
 }
 
-/* 按钮基础 */
+/* 按钮 */
 QPushButton {
     border-radius: 7px; padding: 8px 14px;
     font-weight: 600; font-size: 13px; border: none;
 }
-
-/* ========================================================= */
-/* 开始批量合成按钮 - 立体渐变物理按压样式 */
-/* ========================================================= */
-QPushButton#btnStart {
-    /* 使用 background 保证渐变在所有 Qt 引擎中生效 */
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2591ff, stop:1 #0073ea);
-    border: 1px solid #005bb8;      
-    border-top: 1px solid #5ab0ff;  
-    color: #ffffff;                 
-    font-size: 15px; 
-    font-weight: 800;               
-    letter-spacing: 2px;            
-    padding: 12px 0px;              
-    border-radius: 8px;             
+QPushButton#btnAction {
+    background: #0a84ff; color: #fff;
+    font-size: 13px; font-weight: 700; padding: 11px 0; border-radius: 9px;
 }
-QPushButton#btnStart:hover { 
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #47a3ff, stop:1 #0a80f5);
-    border-top: 1px solid #7bc0ff;  
-}
-QPushButton#btnStart:pressed { 
-    background: #005ac8;      
-    border: 1px solid #00408a;      
-    padding-top: 14px; 
-    padding-bottom: 10px; 
-}
-QPushButton#btnStart:disabled { 
-    background: #24242c; 
-    border: 1px solid #1e1e28;
-    color: #505060; 
-}
-/* ========================================================= */
+QPushButton#btnAction:hover   { background: #2d96ff; }
+QPushButton#btnAction:pressed { background: #0060df; }
+QPushButton#btnAction:disabled { background: #1e1e28; color: #3c3c4e; }
 
 QPushButton#btnGhost {
     background: #1c1c24; color: #8888a8;
@@ -355,10 +329,62 @@ class MainWindow(QMainWindow):
         self._template    = FrameTemplate()
         self._batch_paths : List[str] = []
         self._worker      = None
+        self._frame_path   = ""
+        self._prev_bg_path = ""
+        self._settings    = QSettings(APP_ORG, APP_NAME)
         self._build_ui()
         self.setStyleSheet(QSS)
         self.setStatusBar(QStatusBar())
+        self._load_settings()
         self._status("就绪")
+
+    # ── 设置持久化 ────────────────────────────────────────────
+    def _load_settings(self):
+        s = self._settings
+        # 相框图路径
+        fr = s.value("frame_path","")
+        if fr and Path(fr).exists():
+            from PIL import Image as _I
+            self._frame_rgba = __import__("__main__").extract_frame(_I.open(fr))
+            self.lbl_fr.setText(Path(fr).name)
+            if self._bg_pil: self._sync_canvas()
+        # 预览背景图路径
+        bg = s.value("prev_bg_path","")
+        if bg and Path(bg).exists():
+            from PIL import Image as _I
+            self._bg_pil = _I.open(bg).convert("RGB")
+            self.lbl_prev_bg.setText(Path(bg).name)
+            if self._frame_rgba: self._sync_canvas()
+        # 滑块位置
+        cx    = s.value("cx",    0.50, type=float)
+        cy    = s.value("cy",    0.50, type=float)
+        scale = s.value("scale", 0.40, type=float)
+        for sld,spn,v in [(self.sld_cx,self.spn_cx,int(cx*100)),
+                          (self.sld_cy,self.spn_cy,int(cy*100)),
+                          (self.sld_scale,self.spn_scale,int(scale*100))]:
+            sld.blockSignals(True); sld.setValue(v); sld.blockSignals(False)
+            spn.blockSignals(True); spn.setValue(v/100); spn.blockSignals(False)
+        # 批量列表
+        batch = s.value("batch_paths",[])
+        if isinstance(batch, str): batch = [batch]
+        for p in batch:
+            if Path(p).exists() and p not in self._batch_paths:
+                self._batch_paths.append(p)
+                self.lst_batch.addItem(QListWidgetItem(Path(p).name))
+        self.lbl_count.setText(f"{len(self._batch_paths)} 张待合成")
+        self._check_run_ready()
+
+    def _save_settings(self):
+        s = self._settings
+        s.setValue("frame_path",   getattr(self,"_frame_path",""))
+        s.setValue("prev_bg_path", getattr(self,"_prev_bg_path",""))
+        s.setValue("cx",    self.sld_cx.value()/100)
+        s.setValue("cy",    self.sld_cy.value()/100)
+        s.setValue("scale", self.sld_scale.value()/100)
+        s.setValue("batch_paths", self._batch_paths)
+
+    def closeEvent(self, e):
+        self._save_settings(); super().closeEvent(e)
 
     # ── 构建 UI ───────────────────────────────────────────────
     def _build_ui(self):
@@ -510,18 +536,16 @@ class MainWindow(QMainWindow):
         scroll.setWidget(inner)
         ll.addWidget(scroll,1)
 
-        # 底部固定按钮区 —— 修复了透明穿透 Bug
-        bot = QWidget()
-        bot.setObjectName("botArea")
+        # 底部固定按钮区
+        bot = QWidget(); bot.setStyleSheet("background:transparent;")
         bl = QVBoxLayout(bot); bl.setContentsMargins(16,8,16,14); bl.setSpacing(6)
 
         self.prog = QProgressBar(); self.prog.setFixedHeight(4)
         self.prog.setTextVisible(False); self.prog.setVisible(False)
         bl.addWidget(self.prog)
 
-        # 绑定 btnStart 样式
-        self.btn_run = QPushButton("开始批量合成")
-        self.btn_run.setObjectName("btnStart")
+        self.btn_run = QPushButton("🚀  开始批量合成")
+        self.btn_run.setObjectName("btnAction")
         self.btn_run.setEnabled(False)
         self.btn_run.clicked.connect(self._run_batch)
         bl.addWidget(self.btn_run)
@@ -586,6 +610,7 @@ class MainWindow(QMainWindow):
             filter="图片 (*.jpg *.jpeg *.png *.webp *.bmp);;所有文件 (*.*)")
         if not path: return
         self._frame_rgba = extract_frame(Image.open(path))
+        self._frame_path = path
         self.lbl_fr.setText(Path(path).name)
         self._status(f"相框图: {Path(path).name}（已自动抠图）")
         self._check_save_tpl_ready()
@@ -597,6 +622,7 @@ class MainWindow(QMainWindow):
             filter="图片 (*.jpg *.jpeg *.png *.webp *.bmp);;所有文件 (*.*)")
         if not path: return
         self._bg_pil = Image.open(path).convert("RGB")
+        self._prev_bg_path = path
         self.lbl_prev_bg.setText(Path(path).name)
         self._status(f"预览背景: {Path(path).name}  {self._bg_pil.width}×{self._bg_pil.height}")
         self._check_save_tpl_ready()

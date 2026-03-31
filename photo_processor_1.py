@@ -1,5 +1,5 @@
 """
-主图合成工具 v5  —  支持导入相框坐标模板 + 全局记忆
+主图合成工具 v7  —  纯净 JSON 坐标物理内嵌版 (无预览精简版)
 pip install PyQt6 pillow numpy
 """
 
@@ -8,7 +8,7 @@ from pathlib import Path
 from typing  import Optional, List
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -43,7 +43,6 @@ QScrollArea { border: none; background: transparent; }
 QScrollBar:vertical { background: transparent; width: 5px; }
 QScrollBar::handle:vertical { background: #2a2a36; border-radius: 2px; min-height: 20px; }
 QScrollBar::handle:vertical:hover { background: #3a3a48; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 
 QLineEdit {
     background-color: #1e1e24; border: 1px solid #2c2c36;
@@ -177,70 +176,45 @@ QStatusBar {
 QFrame#divider { background-color: #2c2c36; border: none; max-height: 1px; }
 """
 
-def load_smart_template(tpl_path: str) -> Image.Image:
-    img = Image.open(tpl_path)
+# ─────────────────────────────────────────────────────────────
+# 核心图像处理：物理挖洞内嵌 (基于精准 JSON 坐标)
+# ─────────────────────────────────────────────────────────────
 
-    if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
-        rgba_img = img.convert("RGBA")
-        extrema = rgba_img.getextrema()
-        if extrema[3][0] < 255:
-            return rgba_img
-
-    rgba = img.convert("RGBA")
-    arr  = np.array(rgba)
-    corners = [arr[0,0,:3], arr[0,-1,:3], arr[-1,0,:3], arr[-1,-1,:3]]
-    bg_color = np.mean(corners, axis=0).astype(np.uint8)
-    diff = np.abs(arr[:,:,:3].astype(int) - bg_color.astype(int))
-    mask = np.all(diff < 30, axis=2)
-    arr[mask, 3] = 0
-    return Image.fromarray(arr, "RGBA")
-
-
-def composite_from_template(photo: Image.Image, tpl_path: str,
-                            cx: float, cy: float, scale: float,
-                            out_w: int, out_h: int, dpi: int) -> Image.Image:
-    tpl = load_smart_template(tpl_path)
+def composite_exact_json(photo: Image.Image, tpl_path: str,
+                         left: int, top: int, fw: int, fh: int,
+                         out_w: int, out_h: int) -> Image.Image:
+    """
+    根据 JSON 提供的准确绝对像素坐标，在相框内物理挖洞，将照片刚好镶嵌填充
+    """
+    tpl = Image.open(tpl_path).convert("RGBA")
     tw, th = tpl.size
 
-    alpha = np.array(tpl)[:, :, 3]
-    rows = np.any(alpha == 0, axis=1)
-    cols = np.any(alpha == 0, axis=0)
-    if rows.any() and cols.any():
-        y1, y2 = int(np.where(rows)[0][0]), int(np.where(rows)[0][-1])
-        x1, x2 = int(np.where(cols)[0][0]), int(np.where(cols)[0][-1])
-    else:
-        x1, y1, x2, y2 = 0, 0, tw, th
+    # 防呆机制：如果 JSON 没有尺寸或尺寸异常，默认用全图
+    if fw <= 0 or fh <= 0:
+        left, top, fw, fh = 0, 0, tw, th
 
-    hw, hh = x2 - x1, y2 - y1
+    # 1. 物理挖洞：直接将目标矩形区域的 Alpha 通道刮成 0
+    alpha = tpl.split()[3]
+    draw_alpha = ImageDraw.Draw(alpha)
+    draw_alpha.rectangle([left, top, left + fw, top + fh], fill=0)
+    tpl.putalpha(alpha)
 
+    # 2. 处理照片：等比拉伸、居中裁剪，使其完美填充目标洞口尺寸
     p = photo.convert("RGBA")
-    sc = max(hw / p.width, hh / p.height)
-    p = p.resize((int(p.width*sc), int(p.height*sc)), Image.LANCZOS)
-    lc, tc = (p.width-hw)//2, (p.height-hh)//2
-    p = p.crop((lc, tc, lc+hw, tc+hh))
+    sc = max(fw / p.width, fh / p.height)
+    p = p.resize((max(1, int(p.width * sc)), max(1, int(p.height * sc))), Image.LANCZOS)
+    lc, tc = (p.width - fw) // 2, (p.height - fh) // 2
+    p = p.crop((lc, tc, lc + fw, tc + fh))
 
-    canvas = Image.new("RGBA", (tw, th), (255,255,255,255))
-    canvas.paste(p, (x1, y1))
+    # 3. 组装合成：创建底层白画布 -> 居中平移后的照片 -> 顶层挖了洞的相框
+    canvas = Image.new("RGBA", (tw, th), (255, 255, 255, 255))
+    canvas.paste(p, (left, top))
     result = Image.alpha_composite(canvas, tpl).convert("RGB")
-    return result.resize((out_w, out_h), Image.LANCZOS)
 
-
-def composite_fixed_coords(photo: Image.Image, tpl_path: str,
-                           coords: list,
-                           out_w: int, out_h: int, dpi: int) -> Image.Image:
-    tpl = load_smart_template(tpl_path)
-    tw, th = tpl.size
-    xs = [p[0] for p in coords]; ys = [p[1] for p in coords]
-    x1,y1,x2,y2 = min(xs),min(ys),max(xs),max(ys)
-    hw, hh = x2-x1, y2-y1
-    p = photo.convert("RGBA")
-    sc = max(hw/p.width, hh/p.height)
-    p = p.resize((int(p.width*sc), int(p.height*sc)), Image.LANCZOS)
-    lc,tc = (p.width-hw)//2, (p.height-hh)//2
-    p = p.crop((lc, tc, lc+hw, tc+hh))
-    canvas = Image.new("RGBA",(tw,th),(255,255,255,255))
-    canvas.paste(p,(x1,y1))
-    return Image.alpha_composite(canvas,tpl).convert("RGB").resize((out_w,out_h),Image.LANCZOS)
+    # 4. 按需输出分辨率
+    if out_w > 0 and out_h > 0:
+        result = result.resize((out_w, out_h), Image.LANCZOS)
+    return result
 
 
 class Worker(QThread):
@@ -249,14 +223,12 @@ class Worker(QThread):
     sig_done = pyqtSignal(int, int)
 
     def __init__(self, inp, out, templates, out_w, out_h, dpi, quality,
-                 coord_mode, cx, cy, scale, fixed_coords):
+                 tpl_left, tpl_top, tpl_fw, tpl_fh):
         super().__init__()
         self.inp, self.out = inp, out
         self.templates = templates
         self.out_w, self.out_h, self.dpi, self.quality = out_w, out_h, dpi, quality
-        self.coord_mode   = coord_mode
-        self.cx, self.cy, self.scale = cx, cy, scale
-        self.fixed_coords = fixed_coords
+        self.tpl_left, self.tpl_top, self.tpl_fw, self.tpl_fh = tpl_left, tpl_top, tpl_fw, tpl_fh
 
     def run(self):
         files = [f for f in Path(self.inp).iterdir()
@@ -274,14 +246,14 @@ class Worker(QThread):
                     suf  = f"_{tp.stem}" if len(self.templates) > 1 else ""
                     name = f"主图_{src.stem}{suf}.jpg"
                     self.sig_log.emit(f"🖼   {tp.name}  →  {name}")
-                    if self.coord_mode == "template":
-                        r = composite_from_template(
-                            photo, tp_str, self.cx, self.cy, self.scale,
-                            self.out_w, self.out_h, self.dpi)
-                    else:
-                        r = composite_fixed_coords(
-                            photo, tp_str, self.fixed_coords,
-                            self.out_w, self.out_h, self.dpi)
+
+                    # 批量时强制使用 JSON 坐标挖洞合成
+                    r = composite_exact_json(
+                        photo, tp_str,
+                        self.tpl_left, self.tpl_top, self.tpl_fw, self.tpl_fh,
+                        self.out_w, self.out_h
+                    )
+
                     r.save(str(Path(self.out)/name), "JPEG",
                            quality=self.quality, dpi=(self.dpi,self.dpi))
                     self.sig_log.emit(f"✅  {name}")
@@ -291,6 +263,10 @@ class Worker(QThread):
             self.sig_prog.emit(i+1, total)
         self.sig_done.emit(ok, fail)
 
+
+# ─────────────────────────────────────────────────────────────
+# UI 基础组件
+# ─────────────────────────────────────────────────────────────
 
 class NoScrollSpinBox(QSpinBox):
     def wheelEvent(self, e): e.ignore()
@@ -343,6 +319,10 @@ def sec(text):
     return l
 
 
+# ─────────────────────────────────────────────────────────────
+# 主窗口
+# ─────────────────────────────────────────────────────────────
+
 class MainWindow(QMainWindow):
     _LC = {
         "✅":"#4ade80","❌":"#f87171","⚠️":"#fbbf24",
@@ -351,17 +331,18 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("主图合成工具")
+        self.setWindowTitle("主图合成工具 (无预览批量纯净版)")
         self.setMinimumSize(860, 620)
-        self.resize(1020, 720)
+        self.resize(960, 720)
+
         self.templates: List[str] = []
         self._worker: Optional[Worker] = None
 
-        self._coord_mode   = "fixed"
-        self._tpl_cx       = 0.5
-        self._tpl_cy       = 0.5
-        self._tpl_scale    = 0.4
-        self._fixed_coords = [(316,195),(967,194),(965,1138),(316,1130)]
+        # JSON 精确坐标存储变量
+        self._tpl_left = 0
+        self._tpl_top  = 0
+        self._tpl_fw   = 0
+        self._tpl_fh   = 0
         self._tpl_json_path = ""
 
         self._settings = QSettings(APP_ORG, APP_NAME)
@@ -397,6 +378,8 @@ class MainWindow(QMainWindow):
         self.spn_dpi.setValue(s.value("out_dpi", 300, type=int))
         self.spn_q.setValue(s.value("out_q", 95, type=int))
 
+        self._check_run_ready()
+
     def _save_settings(self):
         s = self._settings
         s.setValue("inp_dir",      self.row_in.path())
@@ -419,8 +402,8 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(16,14,16,10); root.setSpacing(12)
 
         hdr = QHBoxLayout()
-        t = QLabel("主图合成工具"); t.setStyleSheet("color:#fff;font-size:16px;font-weight:700;")
-        s = QLabel("批量 · 多模板 · 300 DPI"); s.setStyleSheet("color:#606070;font-size:11px;")
+        t = QLabel("主图相框合成"); t.setStyleSheet("color:#fff;font-size:16px;font-weight:700;")
+        s = QLabel("纯净自动化 · JSON精准坐标切割内嵌"); s.setStyleSheet("color:#606070;font-size:11px;")
         hdr.addWidget(t); hdr.addStretch(); hdr.addWidget(s)
         root.addLayout(hdr)
 
@@ -436,69 +419,70 @@ class MainWindow(QMainWindow):
         sp = QSplitter(Qt.Orientation.Horizontal); sp.setHandleWidth(1)
         sp.setStyleSheet("QSplitter::handle{background:#1e1e28;}")
 
-        left_outer = QWidget()
-        lo = QVBoxLayout(left_outer); lo.setContentsMargins(0,0,6,0); lo.setSpacing(0)
-        left = QWidget(); left.setObjectName("leftPanel")
-        ll = QVBoxLayout(left); ll.setContentsMargins(0,0,0,0); ll.setSpacing(0)
+        # ════ 左控制面板 ════
+        lw = QWidget()
+        lw.setStyleSheet("QWidget#lp{background:#161619;border:1px solid #22222e;border-radius:12px;}")
+        lw.setObjectName("lp"); lw.setFixedWidth(400)
+        ll = QVBoxLayout(lw); ll.setContentsMargins(0,0,0,0); ll.setSpacing(0)
 
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         si = QWidget(); sl = QVBoxLayout(si)
         sl.setContentsMargins(16,16,16,12); sl.setSpacing(0)
 
-        sl.addWidget(sec("路  径")); sl.addSpacing(10)
-        self.row_in  = PathRow("📂","输入文件夹（照片）")
-        self.row_out = PathRow("💾","输出文件夹")
+        # ── 1. 路径 ──
+        sl.addWidget(sec("1. 文件夹路径")); sl.addSpacing(10)
+        self.row_in  = PathRow("📂","输入图库（待处理原图）")
+        self.row_out = PathRow("💾","输出位置（保存合成结果）")
         sl.addWidget(self.row_in); sl.addSpacing(8); sl.addWidget(self.row_out)
         sl.addSpacing(18); sl.addWidget(divider()); sl.addSpacing(18)
 
-        sl.addWidget(sec("模  板")); sl.addSpacing(10)
+        # ── 2. 相框模板 ──
+        sl.addWidget(sec("2. 导入相框图纸 (支持PNG/JPG)")); sl.addSpacing(10)
         btn_tpl = QHBoxLayout(); btn_tpl.setSpacing(8)
 
         self.btn_add = QPushButton("＋  添加模板"); self.btn_add.setObjectName("btnAdd"); self.btn_add.setFixedHeight(36)
         self.btn_sel_all = QPushButton("☑  全选"); self.btn_sel_all.setObjectName("btnBrowse"); self.btn_sel_all.setFixedHeight(36)
-        self.btn_del = QPushButton("－  删除选中"); self.btn_del.setObjectName("btnDel"); self.btn_del.setFixedHeight(36)
+        self.btn_del = QPushButton("－  删除"); self.btn_del.setObjectName("btnDel"); self.btn_del.setFixedHeight(36)
 
         btn_tpl.addWidget(self.btn_add,3); btn_tpl.addWidget(self.btn_sel_all,2); btn_tpl.addWidget(self.btn_del,2)
         sl.addLayout(btn_tpl); sl.addSpacing(8)
 
-        self.tpl_list = QListWidget(); self.tpl_list.setFixedHeight(110)
+        self.tpl_list = QListWidget(); self.tpl_list.setFixedHeight(120)
         self.tpl_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         sl.addWidget(self.tpl_list)
 
-        # 核心修正位置：必须在 tpl_list 创建后，才能进行事件绑定
         self.btn_add.clicked.connect(self._add_tpl)
         self.btn_sel_all.clicked.connect(self.tpl_list.selectAll)
         self.btn_del.clicked.connect(self._del_tpl)
+        self.tpl_list.itemSelectionChanged.connect(self._check_run_ready)
 
         sl.addSpacing(18); sl.addWidget(divider()); sl.addSpacing(18)
 
-        sl.addWidget(sec("照片放置坐标")); sl.addSpacing(10)
+        # ── 3. JSON 坐标系 ──
+        sl.addWidget(sec("3. 导入 JSON 挖洞坐标系 (必须)")); sl.addSpacing(10)
 
-        self.btn_import_coord = QPushButton("📥  从相框工具导入坐标模板 (.json)")
+        self.btn_import_coord = QPushButton("📥  选择坐标 JSON (.json)")
         self.btn_import_coord.setObjectName("btnImport")
-        self.btn_import_coord.setFixedHeight(36)
+        self.btn_import_coord.setFixedHeight(38)
         self.btn_import_coord.clicked.connect(self._import_coord)
         sl.addWidget(self.btn_import_coord); sl.addSpacing(8)
 
         coord_box = QWidget(); coord_box.setObjectName("coordBox")
         cb_lay = QVBoxLayout(coord_box); cb_lay.setContentsMargins(12,10,12,10); cb_lay.setSpacing(4)
-
-        self.lbl_coord_mode = QLabel("当前模式：固定像素坐标（默认）")
+        self.lbl_coord_mode = QLabel("状态：尚未导入坐标")
         self.lbl_coord_mode.setStyleSheet("color:#8888a0;font-size:11px;background:transparent;font-weight:600;")
-        self.lbl_coord_file = QLabel("未导入")
-        self.lbl_coord_file.setStyleSheet("color:#505068;font-size:10.5px;background:transparent;")
-        self.lbl_coord_file.setWordWrap(True)
-        self.lbl_coord_detail = QLabel("")
-        self.lbl_coord_detail.setStyleSheet("color:#404055;font-size:10px;background:transparent;")
+        self.lbl_coord_detail = QLabel("程序需要依靠 JSON 指定的边距和宽高，在相框图上精确切割出透明洞口，才能进行照片内嵌合成。")
+        self.lbl_coord_detail.setStyleSheet("color:#f87171;font-size:10.5px;background:transparent; line-height: 1.4;")
         self.lbl_coord_detail.setWordWrap(True)
         cb_lay.addWidget(self.lbl_coord_mode)
-        cb_lay.addWidget(self.lbl_coord_file)
         cb_lay.addWidget(self.lbl_coord_detail)
         sl.addWidget(coord_box)
+
         sl.addSpacing(18); sl.addWidget(divider()); sl.addSpacing(18)
 
-        sl.addWidget(sec("输出规格")); sl.addSpacing(10)
+        # ── 4. 规格 ──
+        sl.addWidget(sec("4. 最终输出规格")); sl.addSpacing(10)
         self.cmb = NoScrollComboBox()
         for p in ["正方形  800×800","正方形  1000×1000","正方形  1200×1200",
                   "竖版 5:7  1500×2100","横版 7:5  2100×1500","自定义…"]:
@@ -527,35 +511,48 @@ class MainWindow(QMainWindow):
         sl.addLayout(g1); sl.addSpacing(8); sl.addLayout(g2); sl.addSpacing(16)
         sl.addStretch()
 
+        # 装载进 scroll
         scroll.setWidget(si); ll.addWidget(scroll,1)
 
+        # ── 底部区 ──
         bot = QWidget()
         bot.setObjectName("botArea")
         bl = QVBoxLayout(bot); bl.setContentsMargins(16,8,16,14); bl.setSpacing(8)
 
-        self.btn_start = QPushButton("🚀  开始批量合成")
+        self.btn_start = QPushButton("🚀  开始一键批量合成")
         self.btn_start.setObjectName("btnStart")
+        self.btn_start.setFixedHeight(44)
+        self.btn_start.setEnabled(False)
         self.btn_start.clicked.connect(self._start)
 
-        self.prog = QProgressBar(); self.prog.setFixedHeight(6); self.prog.setTextVisible(False); self.prog.setVisible(False)
+        self.prog = QProgressBar(); self.prog.setFixedHeight(4)
+        self.prog.setTextVisible(False); self.prog.setVisible(False)
 
         bl.addWidget(self.btn_start); bl.addWidget(self.prog)
-        ll.addWidget(bot); lo.addWidget(left); sp.addWidget(left_outer)
 
+        # 将底部按钮区装载进左面板
+        ll.addWidget(bot)
+
+        # 【修复点】：将整体左面板添加到 Splitter
+        sp.addWidget(lw)
+
+        # ════ 右侧区 (纯净日志) ════
         right_outer = QWidget()
         ro = QVBoxLayout(right_outer); ro.setContentsMargins(6,0,0,0); ro.setSpacing(0)
         right = QWidget(); right.setObjectName("rightPanel")
         rl = QVBoxLayout(right); rl.setContentsMargins(16,14,16,14); rl.setSpacing(10)
+
         log_hdr = QHBoxLayout()
         log_hdr.addWidget(sec("处 理 日 志")); log_hdr.addStretch()
         bc = QPushButton("清空"); bc.setObjectName("btnClear")
         bc.clicked.connect(lambda: self.log_box.clear())
         log_hdr.addWidget(bc); rl.addLayout(log_hdr)
         self.log_box = QTextEdit(); self.log_box.setReadOnly(True)
-        self.log_box.setPlaceholderText("日志将在这里实时显示…")
-        rl.addWidget(self.log_box,1); ro.addWidget(right); sp.addWidget(right_outer)
+        self.log_box.setPlaceholderText("所有处理记录将在这里实时全屏滚动显示…")
+        rl.addWidget(self.log_box, 1)
 
-        sp.setSizes([390,630]); root.addWidget(sp,1)
+        ro.addWidget(right); sp.addWidget(right_outer)
+        sp.setSizes([400, 620]); root.addWidget(sp,1)
 
     _P = {0:(800,800),1:(1000,1000),2:(1200,1200),3:(1500,2100),4:(2100,1500)}
     def _on_preset(self,idx):
@@ -564,21 +561,28 @@ class MainWindow(QMainWindow):
             for s,v in [(self.spn_w,w),(self.spn_h,h)]:
                 s.blockSignals(True); s.setValue(v); s.blockSignals(False)
 
+    def _check_run_ready(self):
+        # 要激活按钮，必须：模板列表有图 + JSON坐标就位
+        ok = (len(self.templates) > 0 and self._tpl_fw > 0)
+        self.btn_start.setEnabled(ok)
+
     def _add_tpl(self):
-        fs,_=QFileDialog.getOpenFileNames(self,"选择模板图",filter="图片 (*.png *.jpg *.jpeg *.bmp *.webp);;所有文件 (*.*)")
+        fs,_=QFileDialog.getOpenFileNames(self,"选择相框模板",filter="图片 (*.png *.jpg *.jpeg *.bmp *.webp);;所有文件 (*.*)")
         for f in fs:
             if f not in self.templates:
                 self.templates.append(f)
                 self.tpl_list.addItem(QListWidgetItem(f"  {Path(f).name}"))
         self.c_tpl.set_value(len(self.templates))
+        self._check_run_ready()
 
     def _del_tpl(self):
         for item in reversed(self.tpl_list.selectedItems()):
             r=self.tpl_list.row(item); self.tpl_list.takeItem(r); self.templates.pop(r)
         self.c_tpl.set_value(len(self.templates))
+        self._check_run_ready()
 
     def _import_coord(self):
-        p,_=QFileDialog.getOpenFileName(self,"选择相框工具导出的坐标模板",filter="JSON (*.json)")
+        p,_=QFileDialog.getOpenFileName(self,"导入相框 JSON",filter="JSON (*.json)")
         if not p: return
         self._load_tpl_json(p, silent=False)
 
@@ -586,34 +590,31 @@ class MainWindow(QMainWindow):
         try:
             with open(path,"r",encoding="utf-8") as f:
                 d = json.load(f)
-            cx    = float(d.get("cx",    0.5))
-            cy    = float(d.get("cy",    0.5))
-            scale = float(d.get("scale", 0.4))
-            ref_w = int(d.get("ref_w", 0))
-            ref_h = int(d.get("ref_h", 0))
-            left  = int(d.get("left",  0))
-            top   = int(d.get("top",   0))
-            right = int(d.get("right", 0))
-            bottom= int(d.get("bottom",0))
-            fw    = int(d.get("frame_w",0))
-            fh    = int(d.get("frame_h",0))
 
-            self._tpl_cx, self._tpl_cy, self._tpl_scale = cx, cy, scale
-            self._coord_mode    = "template"
+            # 提取 JSON 的绝对物理坐标
+            self._tpl_left = int(d.get("left",  0))
+            self._tpl_top  = int(d.get("top",   0))
+            self._tpl_fw   = int(d.get("frame_w",0))
+            self._tpl_fh   = int(d.get("frame_h",0))
             self._tpl_json_path = path
 
-            self.lbl_coord_mode.setText("✅  坐标模式：相框比例坐标（已导入）")
-            self.lbl_coord_mode.setStyleSheet("color:#4ade80;font-size:11px;background:transparent;font-weight:600;")
-            self.lbl_coord_file.setText(f"文件：{Path(path).name}")
+            self.lbl_coord_mode.setText("✅  物理切片模式已就绪")
+            self.lbl_coord_mode.setStyleSheet("color:#4ade80;font-size:12px;background:transparent;font-weight:600;")
+
             self.lbl_coord_detail.setText(
-                f"cx={cx:.3f}  cy={cy:.3f}  scale={scale:.3f}\n"
-                f"参考图 {ref_w}×{ref_h}  |  "
-                f"左{left} 右{right} 上{top} 下{bottom} px  |  相框 {fw}×{fh}")
+                f"源文件: {Path(path).name}\n"
+                f"切口起点: X: {self._tpl_left}px,  Y: {self._tpl_top}px\n"
+                f"相框内板: 宽 {self._tpl_fw}px × 高 {self._tpl_fh}px\n"
+                f"引擎状态: 随时准备切图合成！"
+            )
+            self.lbl_coord_detail.setStyleSheet("color:#a0a0b4;font-size:11px; line-height:1.4;")
+
+            self._check_run_ready()
             if not silent:
-                self.statusBar().showMessage(f"✅ 坐标模板已导入: {Path(path).name}")
+                self.statusBar().showMessage(f"✅ 坐标已应用: {Path(path).name}")
         except Exception as e:
             if not silent:
-                QMessageBox.warning(self,"导入失败",f"读取坐标模板失败：\n{e}")
+                QMessageBox.warning(self,"导入失败",f"读取坐标失败：\n{e}")
 
     def _log(self, msg):
         color="#808090"
@@ -628,26 +629,29 @@ class MainWindow(QMainWindow):
 
     def _on_done(self,ok,fail):
         self.c_ok.set_value(ok); self.c_fail.set_value(fail)
-        self.btn_start.setEnabled(True); self.btn_start.setText("开始批量合成")
+        self.btn_start.setEnabled(True); self.btn_start.setText("🚀  开始一键批量合成")
         self.prog.setVisible(False)
         self.statusBar().showMessage(f"完成  ·  成功 {ok}  失败 {fail}")
-        self._log(f"\n🏁  完成 — 成功 {ok} 张  失败 {fail} 张")
-        msg = f"成功合成 {ok} 张\n\n输出目录：\n{self.row_out.path()}"
+        self._log(f"\n🏁  处理结束 — 成功 {ok} 张，失败 {fail} 张")
+        msg = f"合成完毕！\n\n输出目录：\n{self.row_out.path()}"
         (QMessageBox.information if fail==0 else QMessageBox.warning)(
-            self,"完成", msg if fail==0 else f"成功 {ok}  失败 {fail}\n\n{self.row_out.path()}")
+            self,"任务完成", msg if fail==0 else f"成功 {ok} 张，失败 {fail} 张\n\n{self.row_out.path()}")
 
     def _start(self):
-        inp=self.row_in.path(); out=self.row_out.path()
+        inp = self.row_in.path(); out = self.row_out.path()
         if not inp or not os.path.isdir(inp):
-            QMessageBox.warning(self,"提示","请选择输入文件夹"); return
+            QMessageBox.warning(self,"提示","请选择输入原图所在的文件夹！"); return
         if not out:
-            QMessageBox.warning(self,"提示","请选择输出文件夹"); return
+            QMessageBox.warning(self,"提示","请选择用来保存结果的输出文件夹！"); return
         if not self.templates:
-            QMessageBox.warning(self,"提示","请添加模板"); return
+            QMessageBox.warning(self,"提示","请至少添加一个相框模板图片！"); return
+        if self._tpl_fw <= 0:
+            QMessageBox.warning(self,"提示","请必须导入相框的 JSON 坐标系，这是内嵌的基础！"); return
+
         files=[f for f in Path(inp).iterdir()
                if f.suffix.lower() in SUPPORTED_EXT and not f.name.startswith("主图_")]
         if not files:
-            QMessageBox.warning(self,"提示","未找到图片"); return
+            QMessageBox.warning(self,"提示","原图文件夹中没有找到任何有效图片！"); return
 
         selected_items = self.tpl_list.selectedItems()
         if selected_items:
@@ -655,27 +659,20 @@ class MainWindow(QMainWindow):
         else:
             active_templates = self.templates
 
-        if self._coord_mode == "template":
-            mode_desc = f"比例坐标  cx={self._tpl_cx:.3f}  cy={self._tpl_cy:.3f}  scale={self._tpl_scale:.3f}"
-        else:
-            mode_desc = f"固定像素坐标  {self._fixed_coords}"
-
-        n=len(files)
+        n = len(files)
         self.c_total.set_value(n); self.c_ok.set_value("—"); self.c_fail.set_value("—")
         self.prog.setVisible(True)
         self.prog.setValue(0); self.prog.setMaximum(n)
-        self.btn_start.setEnabled(False); self.btn_start.setText("合成中…")
+        self.btn_start.setEnabled(False); self.btn_start.setText("正在执行强制切割合成...")
 
-        self._log(f"🚀  开始  {n} 张 · 使用 {len(active_templates)} 个模板")
-        self._log(f"    坐标模式: {mode_desc}")
+        self._log(f"🚀  启动流水线：{n} 张原图，应用 {len(active_templates)} 个相框")
+        self._log(f"    坐标引擎：JSON 绝对尺寸 [起口: ({self._tpl_left},{self._tpl_top}), 洞口: {self._tpl_fw}x{self._tpl_fh}]")
 
-        self._worker=Worker(
+        self._worker = Worker(
             inp, out, active_templates,
             self.spn_w.value(), self.spn_h.value(),
             self.spn_dpi.value(), self.spn_q.value(),
-            self._coord_mode,
-            self._tpl_cx, self._tpl_cy, self._tpl_scale,
-            self._fixed_coords
+            self._tpl_left, self._tpl_top, self._tpl_fw, self._tpl_fh
         )
         self._worker.sig_log.connect(self._log)
         self._worker.sig_prog.connect(self._on_prog)
@@ -683,28 +680,27 @@ class MainWindow(QMainWindow):
         self._worker.start()
         self._save_settings()
 
-
 def main():
     if sys.platform=="win32":
-        try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ralo.composite.v5")
+        try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ralo.composite.v7")
         except: pass
         try: ctypes.windll.user32.SetProcessDPIAware()
         except: pass
 
-    app=QApplication(sys.argv)
+    app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    p=QPalette()
+    p = QPalette()
     p.setColor(QPalette.ColorRole.Window,          QColor(17,17,19))
-    p.setColor(QPalette.ColorRole.WindowText,      QColor(221,221,229))
+    p.setColor(QPalette.ColorRole.WindowText,      QColor(216,216,224))
     p.setColor(QPalette.ColorRole.Base,            QColor(14,14,18))
-    p.setColor(QPalette.ColorRole.Text,            QColor(200,200,212))
+    p.setColor(QPalette.ColorRole.Text,            QColor(192,192,208))
     p.setColor(QPalette.ColorRole.Button,          QColor(28,28,34))
-    p.setColor(QPalette.ColorRole.ButtonText,      QColor(200,200,212))
+    p.setColor(QPalette.ColorRole.ButtonText,      QColor(200,200,216))
     p.setColor(QPalette.ColorRole.Highlight,       QColor(10,132,255))
     p.setColor(QPalette.ColorRole.HighlightedText, QColor(255,255,255))
     app.setPalette(p)
-    win=MainWindow(); win.show()
+    win = MainWindow(); win.show()
     sys.exit(app.exec())
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()

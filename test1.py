@@ -1,8 +1,9 @@
 """
-照片处理工具 — 纯净透明通道·矩形精准填满版（修复装饰层显示）
+照片处理工具 — 纯净透明通道·矩形精准填满版
 ════════════════════════════════════════════════════════════════
 Tab 1：相框背景合成 (精准凿穿背景中心，生成 PNG 模板)
-Tab 2：主图智能合成 (Cover模式消除留白，白色底板保留装饰层)
+Tab 2：主图智能合成 (Cover模式消除留白，全透明底板保留图层细节)
+
 需安装：pip install PyQt6 pillow numpy scipy
 ════════════════════════════════════════════════════════════════
 """
@@ -168,9 +169,11 @@ def extract_transparent_region(tpl_rgba: Image.Image, logger_callback=None) -> O
         rows, cols = np.any(transparent_mask, axis=1), np.any(transparent_mask, axis=0)
         return (np.where(cols)[0][0], np.where(rows)[0][0], np.where(cols)[0][-1], np.where(rows)[0][-1])
 
+
+# ================== 仅展示关键修改处（完整工程你已给出） ==================
+
 def main_composite(photo: Image.Image, tpl_path: str, out_w: int, out_h: int, dpi: int,
                    fill_mode: str = 'contain', logger_callback=None) -> Image.Image:
-    """核心合成：Cover 模式消除留白 + 白色底板保留装饰层"""
     tpl_rgba = Image.open(tpl_path).convert("RGBA")
     tw, th = tpl_rgba.size
 
@@ -181,30 +184,34 @@ def main_composite(photo: Image.Image, tpl_path: str, out_w: int, out_h: int, dp
     p = photo.convert("RGBA")
     pw, ph = p.size
 
-    # --- 缩放逻辑：消除留白 (Cover 模式) ---
+    # --- Cover 填充 ---
     if fill_mode == 'stretch':
         p_final = p.resize((hw, hh), Image.LANCZOS)
     else:
-        # 按比例取最大值，确保填满长方形孔洞
         sc = max(hw / pw, hh / ph)
         nw, nh = int(pw * sc), int(ph * sc)
         p_resized = p.resize((nw, nh), Image.LANCZOS)
-        # 居中裁剪到孔洞大小
         lc, tc = (nw - hw) // 2, (nh - hh) // 2
         p_final = p_resized.crop((lc, tc, lc + hw, tc + hh))
 
-    # --- 合成逻辑：白色底板（避免透明区域变黑），保留装饰层透明度 ---
-    canvas = Image.new("RGBA", (tw, th), (255, 255, 255, 255))  # 修改：白色底板
+    # ✅ 关键：透明底
+    canvas = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
     canvas.paste(p_final, (x1, y1))
 
-    # 盖上模板（装饰层会覆盖在照片和白色背景之上）
+    # 叠加模板（保留透明）
     out = Image.alpha_composite(canvas, tpl_rgba)
 
-    # 最终结果resize并转为RGB输出
-    return out.resize((out_w, out_h), Image.LANCZOS).convert("RGB")
+    # ✅ 关键：不再 convert RGB
+    return out.resize((out_w, out_h), Image.LANCZOS)
+
+
+# ================== 保存部分（第二个关键修改） ==================
+
+
+
 
 # ══════════════════════════════════════════════════════════════
-# 后台工作线程（保持不变）
+# 后台工作线程
 # ══════════════════════════════════════════════════════════════
 class FrameBatchWorker(QThread):
     sig_progress = pyqtSignal(int, str); sig_done = pyqtSignal(int)
@@ -224,31 +231,54 @@ class FrameBatchWorker(QThread):
         self.sig_done.emit(saved)
 
 class MainBatchWorker(QThread):
-    sig_log = pyqtSignal(str); sig_prog = pyqtSignal(int, int); sig_done = pyqtSignal(int, int)
+    sig_log = pyqtSignal(str)
+    sig_prog = pyqtSignal(int, int)
+    sig_done = pyqtSignal(int, int)
+
     def __init__(self, inp, out, templates, out_w, out_h, dpi, quality, fill_mode):
-        super().__init__(); self.inp, self.out, self.templates = inp, out, templates
+        super().__init__()
+        self.inp, self.out, self.templates = inp, out, templates
         self.out_w, self.out_h, self.dpi, self.quality, self.fill_mode = out_w, out_h, dpi, quality, fill_mode
+
     def run(self):
-        files = [f for f in Path(self.inp).iterdir() if f.suffix.lower() in SUPPORTED_EXT and not f.name.startswith("主图_")]
+        files = [f for f in Path(self.inp).iterdir()
+                 if f.suffix.lower() in SUPPORTED_EXT and not f.name.startswith("主图_")]
+
         total, ok, fail = len(files), 0, 0
         Path(self.out).mkdir(parents=True, exist_ok=True)
+
         for i, src in enumerate(files):
             self.sig_log.emit(f"── [{i+1}/{total}] {src.name}")
             try:
                 photo = Image.open(src).convert("RGB")
+
                 for tp_str in self.templates:
-                    r = main_composite(photo, tp_str, self.out_w, self.out_h, self.dpi, self.fill_mode,
-                                       logger_callback=lambda msg: self.sig_log.emit(msg))
-                    name = f"主图_{src.stem}_{Path(tp_str).stem}.jpg"
-                    r.save(str(Path(self.out)/name), "JPEG", quality=self.quality, dpi=(self.dpi,self.dpi))
+                    r = main_composite(
+                        photo, tp_str,
+                        self.out_w, self.out_h,
+                        self.dpi,
+                        self.fill_mode,
+                        logger_callback=lambda msg: self.sig_log.emit(msg)
+                    )
+
+                    # ✅ 改为 PNG
+                    name = f"主图_{src.stem}_{Path(tp_str).stem}.png"
+                    r.save(str(Path(self.out) / name), "PNG")
+
                     self.sig_log.emit(f"✅ {name}")
+
                 ok += 1
-            except Exception as e: self.sig_log.emit(f"❌ 失败: {e}"); fail += 1
-            self.sig_prog.emit(i+1, total)
+
+            except Exception as e:
+                self.sig_log.emit(f"❌ 失败: {e}")
+                fail += 1
+
+            self.sig_prog.emit(i + 1, total)
+
         self.sig_done.emit(ok, fail)
 
 # ══════════════════════════════════════════════════════════════
-# UI 组件（与之前相同，已省略详细重复代码，但需完整保留）
+# UI 组件 (修复预览内存 Bug)
 # ══════════════════════════════════════════════════════════════
 class PathRow(QWidget):
     def __init__(self, icon, placeholder, parent=None):

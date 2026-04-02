@@ -1,46 +1,417 @@
-"""
-照片处理工具 — 纯净透明通道·矩形精准填满版
-════════════════════════════════════════════════════════════════
-Tab 1：相框背景合成 (精准凿穿背景中心，生成 PNG 模板)
-Tab 2：主图智能合成 (Cover模式消除留白，全透明底板保留图层细节)
-
-需安装：pip install PyQt6 pillow numpy scipy
-════════════════════════════════════════════════════════════════
-"""
-
 import sys, os, json, ctypes, logging
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QFrame,
     QStatusBar, QMessageBox, QSlider, QListWidget, QListWidgetItem,
     QProgressBar, QScrollArea, QAbstractItemView, QDoubleSpinBox,
-    QTabWidget, QSpinBox, QTextEdit, QLineEdit, QCheckBox
+    QTabWidget, QSpinBox, QTextEdit, QLineEdit, QCheckBox, QComboBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QPixmap, QImage, QCursor, QColor, QPalette
 
-# 导入 scipy 进行连通域精准分析
 try:
-    from scipy.ndimage import label
-    SCIPY_AVAILABLE = True
+    from scipy.ndimage import label as scipy_label
+    SCIPY_OK = True
 except ImportError:
-    SCIPY_AVAILABLE = False
+    SCIPY_OK = False
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
-CONFIG_FILE = Path(__file__).parent / "photo_tool_config.json"
+CONFIG_FILE   = Path(__file__).parent / "photo_tool_config.json"
 
-# ══════════════════════════════════════════════════════════════
-# UI 辅助工具函数
-# ══════════════════════════════════════════════════════════════
+def load_cfg():
+    try:
+        if CONFIG_FILE.exists():
+            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+def save_cfg(d):
+    try:
+        CONFIG_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.warning(f"配置保存失败: {e}")
+
+QSS = """
+* { box-sizing: border-box; outline: none; }
+QMainWindow { background: #111113; }
+QWidget { color: #dddde5; font-family: "Microsoft YaHei UI","PingFang SC",sans-serif; font-size: 13px; background: transparent; }
+QWidget#root { background: #111113; }
+QWidget#panel { background: #161619; border: 1px solid #24242c; border-radius: 12px; }
+QWidget#rpanel { background: #161619; border: 1px solid #24242c; border-radius: 12px; }
+QTabWidget::pane { border: none; margin-top: 2px; background: transparent; }
+QTabBar::tab { background: #1a1a22; color: #606075; padding: 9px 32px; border-radius: 8px 8px 0 0; margin-right: 3px; font-size: 13px; font-weight: 600; }
+QTabBar::tab:selected { background: #22222e; color: #dddde5; }
+QTabBar::tab:hover:!selected { background: #1e1e28; color: #9898b8; }
+QLabel#sec { color: #505068; font-size: 10px; font-weight: 700; letter-spacing: 2.5px; background: transparent; }
+QFrame#div { background: #26263a; border: none; max-height: 1px; }
+QLineEdit { background: #1e1e28; border: 1px solid #2c2c3c; border-radius: 7px; padding: 8px 10px; color: #a8a8c0; font-size: 12px; }
+QLineEdit:focus { border-color: #2c2c3c; }
+QLineEdit[readOnly="true"] { color: #505068; }
+QListWidget { background: #1a1a22; border: 1px solid #2c2c3c; border-radius: 8px; color: #b8b8cc; outline: none; padding: 3px; font-size: 12px; }
+QListWidget::item { padding: 7px 10px; border-radius: 5px; }
+QListWidget::item:selected { background: #0a84ff; color: #fff; }
+QListWidget::item:hover:!selected { background: #242434; }
+QSlider::groove:horizontal { height: 3px; background: #282838; border-radius: 1px; }
+QSlider::handle:horizontal { width: 13px; height: 13px; margin: -5px 0; background: #c0c0d8; border-radius: 7px; }
+QSlider::handle:horizontal:hover { background: #fff; }
+QSlider::sub-page:horizontal { background: #0a84ff; border-radius: 1px; }
+QDoubleSpinBox, QSpinBox { background: #1e1e28; border: 1px solid #2c2c3c; border-radius: 6px; padding: 5px 6px; color: #a8a8c0; font-size: 12px; }
+QDoubleSpinBox { min-width: 64px; max-width: 64px; font-family: "Cascadia Code","Consolas",monospace; }
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button, QSpinBox::up-button, QSpinBox::down-button { background: #24242e; border: none; width: 15px; }
+QComboBox { background: #1e1e28; border: 1px solid #2c2c3c; border-radius: 7px; padding: 7px 10px; color: #a8a8c0; font-size: 12px; }
+QComboBox::drop-down { border: none; width: 20px; }
+QComboBox QAbstractItemView { background: #20202c; border: 1px solid #32323e; color: #c0c0d0; selection-background-color: #0a84ff; outline: none; }
+QCheckBox { color: #9090a8; font-size: 12px; spacing: 6px; }
+QCheckBox::indicator { width: 14px; height: 14px; border-radius: 4px; border: 1.5px solid #38384a; background: #1e1e28; }
+QCheckBox::indicator:checked { background: #0a84ff; border-color: #0a84ff; }
+QProgressBar { background: #1a1a22; border: none; border-radius: 2px; height: 4px; color: transparent; }
+QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #0a84ff,stop:1 #5ac8fa); border-radius: 2px; }
+QTextEdit { background: #0e0e16; border: 1px solid #1e1e2a; border-radius: 9px; color: #707080; font-family: "Cascadia Code","Consolas","Courier New",monospace; font-size: 11.5px; padding: 10px; }
+QPushButton { background: #24242e; color: #c8c8dc; border-radius: 7px; padding: 8px 14px; font-weight: 600; font-size: 13px; border: none; }
+QPushButton:hover { background: #30303e; color: #fff; }
+QPushButton:disabled { background: #1a1a22; color: #404050; }
+QPushButton#btnPrimary { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #2591ff,stop:1 #0073ea); border: 1px solid #005bb8; border-top: 1px solid #5ab0ff; color: #fff; font-size: 14px; font-weight: 800; padding: 12px 0; border-radius: 9px; }
+QPushButton#btnPrimary:hover { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #47a3ff,stop:1 #0a80f5); }
+QPushButton#btnPrimary:disabled { background: #1e1e28; border: 1px solid #22222a; color: #404052; }
+QPushButton#btnGhost { background: #1e1e2a; color: #8080a0; border: 1px solid #32323e; font-size: 12px; }
+QPushButton#btnGhost:hover { background: #28283a; color: #c0c0d8; }
+QPushButton#btnGreen { background: rgba(40,196,84,0.13); color: #4ade80; border: 1px solid rgba(40,196,84,0.38); font-size: 12px; font-weight: 600; }
+QPushButton#btnGreen:hover { background: rgba(40,196,84,0.24); }
+QPushButton#btnRed { background: rgba(240,64,48,0.13); color: #f87171; border: 1px solid rgba(240,64,48,0.38); font-size: 12px; font-weight: 600; }
+QPushButton#btnRed:hover { background: rgba(240,64,48,0.24); }
+QPushButton#btnClear { background: rgba(255,255,255,0.05); color: #606070; border: 1px solid rgba(255,255,255,0.12); padding: 4px 12px; font-size: 11px; border-radius: 6px; }
+QPushButton#btnClear:hover { background: rgba(255,255,255,0.1); color: #c0c0d0; }
+QStatusBar { background: #0c0c12; border-top: 1px solid #1a1a22; color: #44445a; font-size: 11px; padding: 2px 14px; }
+QScrollArea { border: none; background: transparent; }
+QScrollBar:vertical { background: transparent; width: 5px; }
+QScrollBar::handle:vertical { background: #282838; border-radius: 2px; min-height: 20px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+"""
+
+# ==============================================================================
+# 改进版：红框解析与擦除函数
+# ==============================================================================
+def parse_red_box(img_rgba: Image.Image, shrink: int = 2) -> Tuple[Optional[Tuple[int,int,int,int]], Image.Image]:
+    """
+    改进版红框检测：
+    - 使用 HSV 色相范围（0-18° 和 342-360°）替代 RGB 比值，对偏橙/偏粉红色更鲁棒
+    - 取面积最大的连通红色区域，排除散点/其他红色元素干扰
+    - 向内收缩 shrink 像素得到净填充区域（去掉线宽影响）
+    - 增加面积合理性校验，防止误检
+    - 只清除红色边框像素的 alpha，不影响框内其他像素
+    返回 (净填充坐标, 清除红线后的图像)，未检测到则返回 (None, 原图)
+    """
+    arr = np.array(img_rgba)
+    if arr.shape[2] < 4:
+        return None, img_rgba
+
+    r = arr[:, :, 0].astype(float)
+    g = arr[:, :, 1].astype(float)
+    b = arr[:, :, 2].astype(float)
+    a = arr[:, :, 3].astype(int)
+
+    # 归一化到 [0, 1]
+    r01 = r / 255.0
+    g01 = g / 255.0
+    b01 = b / 255.0
+
+    # 向量化计算 HSV
+    maxc = np.maximum(np.maximum(r01, g01), b01)
+    minc = np.minimum(np.minimum(r01, g01), b01)
+    delta = maxc - minc
+
+    s = np.where(maxc > 0, delta / maxc, 0.0)   # 饱和度
+    v = maxc                                      # 明度
+
+    # 色相（只需计算 maxc==r 的区域）
+    h = np.zeros_like(r01)
+    mask_r_max = (maxc == r01) & (delta > 1e-6)
+    h[mask_r_max] = (60.0 * ((g01[mask_r_max] - b01[mask_r_max]) / delta[mask_r_max])) % 360.0
+
+    # 红色判定：色相在 0-18° 或 342-360°，饱和度 > 0.55，明度 > 0.35，非透明
+    red_mask = (
+            ((h <= 18.0) | (h >= 342.0)) &
+            (s > 0.55) &
+            (v > 0.35) &
+            (a > 20)
+    )
+
+    if not red_mask.any():
+        return None, img_rgba
+
+    h_img, w_img = arr.shape[:2]
+
+    # 取最大连通区域（有 scipy 用 scipy，没有直接用全部红色像素）
+    if SCIPY_OK:
+        labeled, num = scipy_label(red_mask)
+        if num == 0:
+            return None, img_rgba
+        sizes = np.bincount(labeled.ravel())
+        sizes[0] = 0
+        target = int(np.argmax(sizes))
+        clean_mask = (labeled == target)
+    else:
+        clean_mask = red_mask
+
+    # 面积合理性校验：红色区域应 > 模板面积的 0.5%
+    if int(clean_mask.sum()) < int(w_img * h_img * 0.005):
+        log.info("   红色区域面积过小，可能误检，跳过红框识别")
+        return None, img_rgba
+
+    # 取外边界 bounding box
+    ys, xs = np.where(clean_mask)
+    x1_outer = int(xs.min())
+    y1_outer = int(ys.min())
+    x2_outer = int(xs.max()) + 1
+    y2_outer = int(ys.max()) + 1
+
+    # 向内收缩得到净填充区域（去掉线宽的影响）
+    x1 = x1_outer + shrink
+    y1 = y1_outer + shrink
+    x2 = x2_outer - shrink
+    y2 = y2_outer - shrink
+
+    # 校验收缩后区域有效性
+    if x2 <= x1 or y2 <= y1:
+        log.warning("   收缩后区域无效，回退使用外框坐标")
+        x1, y1, x2, y2 = x1_outer, y1_outer, x2_outer, y2_outer
+
+    log.info(
+        f"   🎯 红框检测成功：外框({x1_outer},{y1_outer})-({x2_outer},{y2_outer})  "
+        f"净填充({x1},{y1})-({x2},{y2})  尺寸={x2-x1}×{y2-y1}"
+    )
+
+    # 只清除红色像素的 alpha（不影响框内其他像素）
+    out_arr = arr.copy()
+    out_arr[clean_mask, 3] = 0
+    cleaned_img = Image.fromarray(out_arr, 'RGBA')
+
+    return (x1, y1, x2, y2), cleaned_img
+
+
+# ==============================================================================
+# 备用：原有透明孔洞识别（当没有画红框时触发）
+# ==============================================================================
+def find_main_hole_fallback(tpl_rgba: Image.Image) -> Tuple[int, int, int, int]:
+    arr = np.array(tpl_rgba)
+    h_img, w_img = arr.shape[:2]
+
+    if arr.shape[2] < 4:
+        return 0, 0, w_img, h_img
+
+    alpha = arr[:, :, 3]
+    mask = (alpha < 128)
+
+    if not mask.any():
+        return 0, 0, w_img, h_img
+
+    if SCIPY_OK:
+        labeled, num = scipy_label(mask)
+        if num == 0:
+            ys, xs = np.where(mask)
+            return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+        sizes = np.bincount(labeled.ravel())
+        sizes[0] = 0
+        target_label = int(np.argmax(sizes))
+        ys, xs = np.where(labeled == target_label)
+        return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+    ys, xs = np.where(mask)
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def photo_cover_fill(photo: Image.Image, box_w: int, box_h: int) -> Image.Image:
+    """将照片以 cover 模式填充到指定尺寸（居中裁剪）"""
+    pw, ph = photo.size
+    scale = max(box_w / pw, box_h / ph)
+    new_w = max(int(pw * scale), box_w)
+    new_h = max(int(ph * scale), box_h)
+    resized = photo.resize((new_w, new_h), Image.LANCZOS)
+    left = (new_w - box_w) // 2
+    top  = (new_h - box_h) // 2
+    return resized.crop((left, top, left + box_w, top + box_h))
+
+
+def composite_tab1(bg: Image.Image, frame_rgba: Image.Image, cx: float, cy: float, scale: float) -> Image.Image:
+    """Tab1 预览合成：将相框叠加在背景上。
+
+    针对全不透明模板（如本模板 alpha=255 全黑底）的正确流程：
+    1. parse_red_box 检测红框内边界坐标，擦除红线像素
+    2. 在原图尺寸上直接将红框内部区域设为透明，制作"镂空相框"
+    3. 将镂空相框缩放后 paste 到背景，背景从镂空处透出
+    这样完全不需要在背景上单独挖孔，也不存在坐标缩放误差问题。
+    没有红框时回退到透明孔洞识别。
+    """
+    bw, bh = bg.size
+    fw = int(bw * scale)
+    if fw <= 0:
+        return bg.convert("RGBA")
+    fh = int(frame_rgba.height * fw / frame_rgba.width)
+    if fh <= 0:
+        return bg.convert("RGBA")
+
+    # 1. 检测红框，shrink=9 对应实测线宽 ~8px，擦除红线
+    box, cleaned_frame = parse_red_box(frame_rgba, shrink=9)
+
+    # 2. 在原图尺寸上把红框内部（净填充区）直接挖透明
+    frame_arr = np.array(cleaned_frame)
+    if box:
+        x1, y1, x2, y2 = box
+        frame_arr[y1:y2, x1:x2, 3] = 0
+    else:
+        tmp = Image.fromarray(frame_arr, 'RGBA')
+        hx1, hy1, hx2, hy2 = find_main_hole_fallback(tmp)
+        frame_arr[hy1:hy2, hx1:hx2, 3] = 0
+
+    hollow_frame = Image.fromarray(frame_arr, 'RGBA')
+
+    # 3. 缩放镂空相框并贴到背景
+    fr = hollow_frame.resize((fw, fh), Image.LANCZOS)
+    left = max(0, min(int(cx * bw - fw / 2), bw - fw))
+    top  = max(0, min(int(cy * bh - fh / 2), bh - fh))
+
+    out = bg.convert("RGBA").copy()
+    out.paste(fr, (left, top), fr)
+    return out
+
+
+def composite_tab2(photo: Image.Image, tpl_path: str, out_w: int, out_h: int, dpi: int, logger=None) -> Image.Image:
+    """Tab2 批量合成：将照片填入模板红框/透明孔洞区域"""
+    tpl_orig = Image.open(tpl_path)
+    tpl = tpl_orig.convert("RGBA") if tpl_orig.mode != "RGBA" else tpl_orig.copy()
+    tw, th = tpl.size
+
+    # 优先检测红框（shrink=9 对应实测线宽 ~8px）
+    box, cleaned_tpl = parse_red_box(tpl, shrink=9)
+
+    if box:
+        x1, y1, x2, y2 = box
+        if logger:
+            logger(f"   🎯 红框净填充区域：({x1},{y1})-({x2},{y2})  {x2-x1}×{y2-y1}px")
+    else:
+        x1, y1, x2, y2 = find_main_hole_fallback(cleaned_tpl)
+        if logger:
+            logger(f"   ⚠️  未检测到红框，透明孔洞识别：({x1},{y1})-({x2},{y2})")
+
+    box_w = x2 - x1
+    box_h = y2 - y1
+
+    if box_w <= 0 or box_h <= 0:
+        if logger:
+            logger("   ❌  填充区域宽高为0，回退全图填充")
+        x1, y1, box_w, box_h = 0, 0, tw, th
+
+    # 将模板红框内部区域挖透明（针对全不透明模板）
+    tpl_arr = np.array(cleaned_tpl)
+    tpl_arr[y1:y2, x1:x2, 3] = 0
+    hollow_tpl = Image.fromarray(tpl_arr, 'RGBA')
+
+    # 照片填充到红框尺寸
+    filled = photo_cover_fill(photo.convert("RGBA"), box_w, box_h)
+
+    # 照片铺在画布上，镂空模板盖在上面
+    canvas = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
+    canvas.paste(filled, (x1, y1))
+    result = Image.alpha_composite(canvas, hollow_tpl)
+    result = result.resize((out_w, out_h), Image.LANCZOS)
+    return result
+
+
+# ==============================================================================
+# 后台线程
+# ==============================================================================
+class FrameBatchWorker(QThread):
+    sig_progress = pyqtSignal(int, str)
+    sig_done     = pyqtSignal(int)
+    sig_error    = pyqtSignal(str)
+
+    def __init__(self, bg_paths, frame_rgba, cx, cy, scale, out_dir):
+        super().__init__()
+        self.bg_paths  = bg_paths
+        self.frame_rgba = frame_rgba
+        self.cx, self.cy, self.scale = cx, cy, scale
+        self.out_dir = out_dir
+
+    def run(self):
+        saved = 0
+        for i, path in enumerate(self.bg_paths):
+            try:
+                bg  = Image.open(path).convert("RGB")
+                r   = composite_tab1(bg, self.frame_rgba, self.cx, self.cy, self.scale)
+                out = str(Path(self.out_dir) / f"{Path(path).stem}_模板.png")
+                r.save(out, "PNG")
+                saved += 1
+                self.sig_progress.emit(i + 1, Path(path).name)
+            except Exception as e:
+                self.sig_error.emit(f"{Path(path).name}: {e}")
+        self.sig_done.emit(saved)
+
+
+class MainBatchWorker(QThread):
+    sig_log  = pyqtSignal(str)
+    sig_prog = pyqtSignal(int, int)
+    sig_done = pyqtSignal(int, int)
+
+    def __init__(self, inp, out, templates, out_w, out_h, dpi, quality, save_png):
+        super().__init__()
+        self.inp, self.out = inp, out
+        self.templates = templates
+        self.out_w, self.out_h, self.dpi = out_w, out_h, dpi
+        self.quality, self.save_png = quality, save_png
+
+    def run(self):
+        files = [f for f in Path(self.inp).iterdir()
+                 if f.suffix.lower() in SUPPORTED_EXT and not f.name.startswith("主图_")]
+        total, ok, fail = len(files), 0, 0
+        Path(self.out).mkdir(parents=True, exist_ok=True)
+
+        for i, src in enumerate(files):
+            self.sig_log.emit(f"\n── [{i+1}/{total}]  {src.name}")
+            try:
+                photo = Image.open(src).convert("RGB")
+                for tp_str in self.templates:
+                    tp  = Path(tp_str)
+                    suf = f"_{tp.stem}" if len(self.templates) > 1 else ""
+                    ext = ".png" if self.save_png else ".jpg"
+                    name = f"主图_{src.stem}{suf}{ext}"
+                    self.sig_log.emit(f"🖼   {tp.name} → {name}")
+
+                    result = composite_tab2(
+                        photo, tp_str,
+                        self.out_w, self.out_h, self.dpi,
+                        logger=lambda m: self.sig_log.emit(m)
+                    )
+
+                    out_path = str(Path(self.out) / name)
+                    if self.save_png:
+                        result.save(out_path, "PNG")
+                    else:
+                        result.convert("RGB").save(
+                            out_path, "JPEG",
+                            quality=self.quality, dpi=(self.dpi, self.dpi))
+                    self.sig_log.emit(f"✅  {name}")
+                ok += 1
+            except Exception as e:
+                self.sig_log.emit(f"❌  {e}")
+                fail += 1
+            self.sig_prog.emit(i + 1, total)
+
+        self.sig_done.emit(ok, fail)
+
+
+# ==============================================================================
+# UI 工具函数
+# ==============================================================================
 def sec(text):
     l = QLabel(text)
     l.setObjectName("sec")
@@ -52,356 +423,805 @@ def div():
     f.setFrameShape(QFrame.Shape.HLine)
     return f
 
-def load_cfg() -> dict:
-    try:
-        if CONFIG_FILE.exists():
-            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    except Exception: pass
-    return {}
 
-def save_cfg(d: dict):
-    try: CONFIG_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e: log.warning(f"配置保存失败: {e}")
-
-# ══════════════════════════════════════════════════════════════
-# 样式表
-# ══════════════════════════════════════════════════════════════
-QSS = """
-* { box-sizing: border-box; outline: none; }
-QMainWindow { background: #111113; }
-QWidget { color: #dddde5; font-family: "Microsoft YaHei UI",sans-serif; font-size: 13px; background: transparent; }
-QTabWidget::pane { border: none; margin-top: 2px; }
-QTabBar::tab { background: #1a1a22; color: #606075; padding: 9px 28px; border-radius: 8px 8px 0 0; margin-right: 3px; }
-QTabBar::tab:selected { background: #22222e; color: #dddde5; }
-QWidget#panel { background: #161619; border: 1px solid #24242c; border-radius: 12px; }
-QLabel#sec { color: #505068; font-size: 10px; font-weight: 700; letter-spacing: 2.5px; }
-QFrame#div { background: #26263a; max-height: 1px; }
-QLineEdit, QSpinBox, QDoubleSpinBox { background: #1e1e28; border: 1px solid #2c2c3c; border-radius: 7px; padding: 7px; color: #a8a8c0; }
-QListWidget { background: #1a1a22; border: 1px solid #2c2c3c; border-radius: 8px; color: #b8b8cc; }
-QProgressBar { background: #1a1a22; border-radius: 2px; height: 4px; color: transparent; }
-QProgressBar::chunk { background: #0a84ff; border-radius: 2px; }
-QTextEdit { background: #0e0e16; border: 1px solid #1e1e2a; border-radius: 9px; color: #707080; font-family: Consolas, monospace; }
-QPushButton { background: #24242e; color: #c8c8dc; border-radius: 7px; padding: 8px 14px; font-weight: 600; }
-QPushButton:hover { background: #30303e; color: #fff; }
-QPushButton#btnPrimary { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #2591ff,stop:1 #0073ea); color: #fff; }
-QPushButton#btnGhost { background: #1e1e2a; color: #8080a0; border: 1px solid #32323e; }
-QPushButton#btnGreen { background: rgba(40,196,84,0.13); color: #4ade80; }
-QPushButton#btnRed { background: rgba(240,64,48,0.13); color: #f87171; }
-"""
-
-# ══════════════════════════════════════════════════════════════
-# Tab 1 专用：凿穿合成逻辑
-# ══════════════════════════════════════════════════════════════
-def frame_composite_with_punch(bg: Image.Image, frame_rgba: Image.Image, cx: float, cy: float, scale: float) -> Image.Image:
-    bw, bh = bg.size
-    fw = int(bw * scale)
-    fh = int(frame_rgba.height * fw / frame_rgba.width)
-    if fw <= 0 or fh <= 0: return bg.convert("RGBA")
-
-    fr_resized = frame_rgba.resize((fw, fh), Image.LANCZOS)
-    left = max(0, min(int(cx*bw - fw/2), bw-fw))
-    top  = max(0, min(int(cy*bh - fh/2), bh-fh))
-
-    out = bg.convert("RGBA").copy()
-    fr_alpha = fr_resized.getchannel("A")
-    full_mask = Image.new("L", (bw, bh), 255)
-    full_mask.paste(fr_alpha, (left, top))
-
-    out.paste(fr_resized, (left, top), fr_resized)
-    out.putalpha(full_mask)
-    return out
-
-# ══════════════════════════════════════════════════════════════
-# Tab 2 专用：实心矩形孔洞精准识别算法
-# ══════════════════════════════════════════════════════════════
-def extract_transparent_region(tpl_rgba: Image.Image, logger_callback=None) -> Optional[Tuple[int, int, int, int]]:
-    arr = np.array(tpl_rgba)
-    if arr.shape[2] < 4: return None
-    alpha = arr[:, :, 3]
-
-    transparent_mask = (alpha == 0)
-    if not np.any(transparent_mask):
-        if logger_callback: logger_callback(f"   ⚠️ 未检测到透明区域")
-        return None
-
-    if SCIPY_AVAILABLE:
-        labeled, num = label(transparent_mask)
-        sizes = np.bincount(labeled.ravel())
-        sizes[0] = 0
-
-        regions = []
-        w, h = tpl_rgba.size
-        for lid in range(1, num + 1):
-            region = (labeled == lid)
-            rows = np.any(region, axis=1)
-            cols = np.any(region, axis=0)
-            if not rows.any() or not cols.any(): continue
-
-            y1, y2 = np.where(rows)[0][[0, -1]]
-            x1, x2 = np.where(cols)[0][[0, -1]]
-
-            # 计算实心密度：实际透明像素 / 外接矩形面积
-            bbox_area = (x2 - x1 + 1) * (y2 - y1 + 1)
-            actual_area = sizes[lid]
-            density = actual_area / bbox_area if bbox_area > 0 else 0
-
-            # 记录中心距离（用于多孔洞时优先选中间的）
-            dist = np.sqrt(((x1+x2)/2 - w/2)**2 + ((y1+y2)/2 - h/2)**2)
-
-            # 筛选：实心度 > 0.85 且面积适中（排除线条和背景）
-            if density > 0.85 and actual_area > (w * h * 0.01):
-                regions.append({'box': (x1, y1, x2, y2), 'dist': dist, 'density': density})
-
-        if not regions:
-            if logger_callback: logger_callback("   ⚠️ 未锁定实心填充位，使用默认最大透明区")
-            largest_label = np.argmax(sizes)
-            region = (labeled == largest_label)
-            rows, cols = np.any(region, axis=1), np.any(region, axis=0)
-            return (np.where(cols)[0][0], np.where(rows)[0][0], np.where(cols)[0][-1], np.where(rows)[0][-1])
-
-        # 取最靠近中心的实心块
-        best = min(regions, key=lambda x: x['dist'])
-        x1, y1, x2, y2 = best['box']
-        if logger_callback:
-            logger_callback(f"   🎯 精准识别孔洞: ({x1},{y1})->({x2},{y2}) 实心度:{best['density']:.2f}")
-        return (x1, y1, x2, y2)
-    else:
-        rows, cols = np.any(transparent_mask, axis=1), np.any(transparent_mask, axis=0)
-        return (np.where(cols)[0][0], np.where(rows)[0][0], np.where(cols)[0][-1], np.where(rows)[0][-1])
-
-
-# ================== 仅展示关键修改处（完整工程你已给出） ==================
-
-def main_composite(photo: Image.Image, tpl_path: str, out_w: int, out_h: int, dpi: int,
-                   fill_mode: str = 'contain', logger_callback=None) -> Image.Image:
-    tpl_rgba = Image.open(tpl_path).convert("RGBA")
-    tw, th = tpl_rgba.size
-
-    coords = extract_transparent_region(tpl_rgba, logger_callback)
-    x1, y1, x2, y2 = coords if coords else (0, 0, tw, th)
-
-    hw, hh = x2 - x1 + 1, y2 - y1 + 1
-    p = photo.convert("RGBA")
-    pw, ph = p.size
-
-    # --- Cover 填充 ---
-    if fill_mode == 'stretch':
-        p_final = p.resize((hw, hh), Image.LANCZOS)
-    else:
-        sc = max(hw / pw, hh / ph)
-        nw, nh = int(pw * sc), int(ph * sc)
-        p_resized = p.resize((nw, nh), Image.LANCZOS)
-        lc, tc = (nw - hw) // 2, (nh - hh) // 2
-        p_final = p_resized.crop((lc, tc, lc + hw, tc + hh))
-
-    # ✅ 关键：透明底
-    canvas = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
-    canvas.paste(p_final, (x1, y1))
-
-    # 叠加模板（保留透明）
-    out = Image.alpha_composite(canvas, tpl_rgba)
-
-    # ✅ 关键：不再 convert RGB
-    return out.resize((out_w, out_h), Image.LANCZOS)
-
-
-# ================== 保存部分（第二个关键修改） ==================
-
-
-
-
-# ══════════════════════════════════════════════════════════════
-# 后台工作线程
-# ══════════════════════════════════════════════════════════════
-class FrameBatchWorker(QThread):
-    sig_progress = pyqtSignal(int, str); sig_done = pyqtSignal(int)
-    def __init__(self, bg_paths, frame_rgba, cx, cy, scale, out_dir):
-        super().__init__(); self.bg_paths, self.frame_rgba = bg_paths, frame_rgba
-        self.cx, self.cy, self.scale, self.out_dir = cx, cy, scale, out_dir
-    def run(self):
-        saved = 0
-        for i, path in enumerate(self.bg_paths):
-            try:
-                bg = Image.open(path).convert("RGB")
-                r = frame_composite_with_punch(bg, self.frame_rgba, self.cx, self.cy, self.scale)
-                out = str(Path(self.out_dir) / f"{Path(path).stem}_透明模板.png")
-                r.save(out, "PNG"); saved += 1
-                self.sig_progress.emit(i+1, Path(path).name)
-            except Exception: pass
-        self.sig_done.emit(saved)
-
-class MainBatchWorker(QThread):
-    sig_log = pyqtSignal(str)
-    sig_prog = pyqtSignal(int, int)
-    sig_done = pyqtSignal(int, int)
-
-    def __init__(self, inp, out, templates, out_w, out_h, dpi, quality, fill_mode):
-        super().__init__()
-        self.inp, self.out, self.templates = inp, out, templates
-        self.out_w, self.out_h, self.dpi, self.quality, self.fill_mode = out_w, out_h, dpi, quality, fill_mode
-
-    def run(self):
-        files = [f for f in Path(self.inp).iterdir()
-                 if f.suffix.lower() in SUPPORTED_EXT and not f.name.startswith("主图_")]
-
-        total, ok, fail = len(files), 0, 0
-        Path(self.out).mkdir(parents=True, exist_ok=True)
-
-        for i, src in enumerate(files):
-            self.sig_log.emit(f"── [{i+1}/{total}] {src.name}")
-            try:
-                photo = Image.open(src).convert("RGB")
-
-                for tp_str in self.templates:
-                    r = main_composite(
-                        photo, tp_str,
-                        self.out_w, self.out_h,
-                        self.dpi,
-                        self.fill_mode,
-                        logger_callback=lambda msg: self.sig_log.emit(msg)
-                    )
-
-                    # ✅ 改为 PNG
-                    name = f"主图_{src.stem}_{Path(tp_str).stem}.png"
-                    r.save(str(Path(self.out) / name), "PNG")
-
-                    self.sig_log.emit(f"✅ {name}")
-
-                ok += 1
-
-            except Exception as e:
-                self.sig_log.emit(f"❌ 失败: {e}")
-                fail += 1
-
-            self.sig_prog.emit(i + 1, total)
-
-        self.sig_done.emit(ok, fail)
-
-# ══════════════════════════════════════════════════════════════
-# UI 组件 (修复预览内存 Bug)
-# ══════════════════════════════════════════════════════════════
 class PathRow(QWidget):
     def __init__(self, icon, placeholder, parent=None):
-        super().__init__(parent); lay=QHBoxLayout(self); lay.setContentsMargins(0,0,0,0); lay.setSpacing(8)
-        ico=QLabel(icon); ico.setFixedWidth(20); ico.setStyleSheet("color:#606070;")
-        self.edit=QLineEdit(); self.edit.setPlaceholderText(placeholder); self.edit.setReadOnly(True)
-        btn=QPushButton("浏览"); btn.setObjectName("btnGhost"); btn.setFixedWidth(52); btn.clicked.connect(self._browse)
-        lay.addWidget(ico); lay.addWidget(self.edit,1); lay.addWidget(btn)
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        ico = QLabel(icon)
+        ico.setFixedWidth(20)
+        ico.setStyleSheet("font-size:15px;background:transparent;color:#606070;")
+        self.edit = QLineEdit()
+        self.edit.setPlaceholderText(placeholder)
+        self.edit.setReadOnly(True)
+        btn = QPushButton("浏览")
+        btn.setObjectName("btnGhost")
+        btn.setFixedWidth(52)
+        btn.clicked.connect(self._browse)
+        lay.addWidget(ico)
+        lay.addWidget(self.edit, 1)
+        lay.addWidget(btn)
+
     def _browse(self):
-        d=QFileDialog.getExistingDirectory(self,"选择文件夹")
-        if d: self.edit.setText(d)
-    def path(self): return self.edit.text().strip()
+        d = QFileDialog.getExistingDirectory(self, "选择文件夹")
+        if d:
+            self.edit.setText(d)
+            self.edit.setToolTip(d)
+
+    def path(self):
+        return self.edit.text().strip()
+
+    def set_path(self, p):
+        self.edit.setText(p)
+        self.edit.setToolTip(p)
+
 
 class PreviewCanvas(QLabel):
     pos_changed = pyqtSignal(float, float)
-    def __init__(self, parent=None):
-        super().__init__(parent); self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(380, 280); self.setStyleSheet("background:#0e0e16;border-radius:10px;")
-        self._bg=self._fr=None; self._cx=0.5; self._cy=0.5; self._sc=0.4
-        self._dragging=False; self._temp_data = None
-    def set_images(self, bg, fr): self._bg,self._fr = bg, fr; self._refresh()
-    def set_placement(self, cx, cy, sc): self._cx,self._cy,self._sc = cx, cy, sc; self._refresh()
-    def _refresh(self):
-        if self._bg is None or self.width()<10: return
-        comp = frame_composite_with_punch(self._bg, self._fr, self._cx, self._cy, self._sc) if self._fr else self._bg.copy()
-        comp.thumbnail((self.width(), self.height()), Image.LANCZOS)
-        self._temp_data = comp.convert("RGBA").tobytes("raw", "RGBA")
-        qi = QImage(self._temp_data, comp.width, comp.height, comp.width*4, QImage.Format.Format_RGBA8888)
-        self.setPixmap(QPixmap.fromImage(qi))
-        self._dr=((self.width()-comp.width)//2,(self.height()-comp.height)//2,comp.width,comp.height)
-    def mousePressEvent(self,e):
-        if e.button()==Qt.MouseButton.LeftButton and self._bg: self._dragging=True
-    def mouseMoveEvent(self,e):
-        if self._dragging and self._bg:
-            dx,dy,pw,ph=self._dr
-            self._cx=max(0.01,min(0.99,(e.position().x()-dx)/pw))
-            self._cy=max(0.01,min(0.99,(e.position().y()-dy)/ph))
-            self._refresh(); self.pos_changed.emit(self._cx, self._cy)
-    def mouseReleaseEvent(self,e): self._dragging=False
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(380, 280)
+        self.setStyleSheet("background:#0e0e16;border-radius:10px;border:1px solid #1e1e2c;")
+        self._bg = self._fr = None
+        self._cx = 0.5
+        self._cy = 0.5
+        self._sc = 0.4
+        self._dragging = False
+        self._dr = (0, 0, 1, 1)
+        self._buf = None
+        ph = QLabel("请先选相框图和预览背景图", self)
+        ph.setStyleSheet("color:#303044;font-size:12px;background:transparent;")
+        ph.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._ph = ph
+
+    def resizeEvent(self, e):
+        self._ph.setGeometry(self.rect())
+        self._refresh()
+        super().resizeEvent(e)
+
+    def set_images(self, bg, fr):
+        self._bg, self._fr = bg, fr
+        self._ph.setVisible(bg is None)
+        self._refresh()
+
+    def set_placement(self, cx, cy, sc):
+        self._cx, self._cy, self._sc = cx, cy, sc
+        self._refresh()
+
+    def _refresh(self):
+        if self._bg is None:
+            return
+        cw, ch = self.width(), self.height()
+        if cw < 10 or ch < 10:
+            return
+        comp = (
+            composite_tab1(self._bg, self._fr, self._cx, self._cy, self._sc)
+            if self._fr else self._bg.convert("RGBA")
+        )
+        comp.thumbnail((cw, ch), Image.LANCZOS)
+        pw, ph = comp.width, comp.height
+        self._buf = comp.convert("RGBA").tobytes("raw", "RGBA")
+        qi = QImage(self._buf, pw, ph, pw * 4, QImage.Format.Format_RGBA8888)
+        self.setPixmap(QPixmap.fromImage(qi))
+        self._dr = ((cw - pw) // 2, (ch - ph) // 2, pw, ph)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self._bg:
+            self._dragging = True
+            self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
+
+    def mouseMoveEvent(self, e):
+        if not self._dragging or not self._bg:
+            return
+        dx, dy, pw, ph = self._dr
+        self._cx = max(0.01, min(0.99, (e.position().x() - dx) / pw))
+        self._cy = max(0.01, min(0.99, (e.position().y() - dy) / ph))
+        self._refresh()
+        self.pos_changed.emit(self._cx, self._cy)
+
+    def mouseReleaseEvent(self, e):
+        self._dragging = False
+        self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+
+
+# ==============================================================================
+# Tab1：相框模板生成
+# ==============================================================================
 class FrameTab(QWidget):
     def __init__(self, cfg, parent=None):
-        super().__init__(parent); self._cfg, self._fr_rgba, self._bg_pil, self._batch_paths = cfg, None, None, []
+        super().__init__(parent)
+        self._cfg = cfg
+        self._fr_rgba = None
+        self._bg_pil  = None
+        self._batch_paths: List[str] = []
+        self._worker = None
         self._build()
-    def _build(self):
-        root = QHBoxLayout(self); root.setContentsMargins(0,8,0,0)
-        lp = QWidget(); lp.setObjectName("panel"); lp.setFixedWidth(300); ll = QVBoxLayout(lp)
-        inner = QWidget(); sl = QVBoxLayout(inner)
-        sl.addWidget(sec("1. 透明相框图 (必须 PNG)")); hr = QHBoxLayout(); self.lbl_fr = QLabel("未选")
-        btn_fr = QPushButton("选择"); btn_fr.setObjectName("btnGhost"); btn_fr.clicked.connect(self._load_fr)
-        hr.addWidget(self.lbl_fr,1); hr.addWidget(btn_fr); sl.addLayout(hr)
-        sl.addWidget(sec("2. 预览背景图")); pr = QHBoxLayout(); self.lbl_prev = QLabel("未选")
-        btn_prev = QPushButton("选择"); btn_prev.setObjectName("btnGhost"); btn_prev.clicked.connect(self._load_bg)
-        pr.addWidget(self.lbl_prev,1); pr.addWidget(btn_prev); sl.addLayout(pr)
-        def add_sld(txt):
-            r=QHBoxLayout(); r.addWidget(QLabel(txt)); s=QSlider(Qt.Orientation.Horizontal); s.setRange(1,99); s.setValue(50)
-            sp=QDoubleSpinBox(); sp.setRange(0.01,0.99); sp.setSingleStep(0.01); sp.setValue(0.5)
-            r.addWidget(s,1); r.addWidget(sp); return r,s,sp
-        r1,self.s1,self.p1=add_sld("H:"); r2,self.s2,self.p2=add_sld("V:"); r3,self.s3,self.p3=add_sld("S:")
-        sl.addLayout(r1); sl.addLayout(r2); sl.addLayout(r3)
-        sl.addWidget(sec("3. 批量生成透明模板")); hr2 = QHBoxLayout()
-        b_a = QPushButton("+添加背景图"); b_a.setObjectName("btnGreen"); b_a.clicked.connect(self._add)
-        hr2.addWidget(b_a,1); sl.addLayout(hr2)
-        self.lst = QListWidget(); sl.addWidget(self.lst)
-        sc = QScrollArea(); sc.setWidgetResizable(True); sc.setWidget(inner); ll.addWidget(sc)
-        self.prog = QProgressBar(); self.prog.setVisible(False)
-        btn_go = QPushButton("🚀 开始生成带洞模板"); btn_go.setObjectName("btnPrimary"); btn_go.clicked.connect(self._run)
-        ll.addWidget(self.prog); ll.addWidget(btn_go); root.addWidget(lp)
-        self.canvas = PreviewCanvas(); self.canvas.pos_changed.connect(self._on_drag); root.addWidget(self.canvas,1); self._link()
-    def _link(self):
-        def lnk(s,p,f):
-            s.valueChanged.connect(lambda v:[p.blockSignals(True),p.setValue(v/100),p.blockSignals(False),f()])
-            p.valueChanged.connect(lambda v:[s.blockSignals(True),s.setValue(int(v*100)),s.blockSignals(False),f()])
-        lnk(self.s1,self.p1,self._apply); lnk(self.s2,self.p2,self._apply); lnk(self.s3,self.p3,self._apply)
-    def _apply(self): self.canvas.set_placement(self.s1.value()/100, self.s2.value()/100, self.s3.value()/100)
-    def _on_drag(self,cx,cy): self.p1.setValue(cx); self.p2.setValue(cy); self._apply()
-    def _load_fr(self):
-        p,_=QFileDialog.getOpenFileName(self, filter="PNG (*.png)");
-        if p: self._fr_rgba = Image.open(p).convert("RGBA"); self.lbl_fr.setText(Path(p).name); self._apply()
-    def _load_bg(self):
-        p,_=QFileDialog.getOpenFileName(self);
-        if p: self._bg_pil = Image.open(p).convert("RGB"); self.lbl_prev.setText(Path(p).name); self.canvas.set_images(self._bg_pil, self._fr_rgba); self._apply()
-    def _add(self): ps,_=QFileDialog.getOpenFileNames(self); self._batch_paths.extend(ps); self.lst.addItems([Path(x).name for x in ps])
-    def _run(self):
-        out = QFileDialog.getExistingDirectory(self)
-        if not out or not self._fr_rgba: return
-        self.prog.setVisible(True); self._worker = FrameBatchWorker(self._batch_paths, self._fr_rgba, self.s1.value()/100, self.s2.value()/100, self.s3.value()/100, out)
-        self._worker.sig_done.connect(lambda: self.prog.setVisible(False)); self._worker.start()
+        self._restore()
 
-class MainTab(QWidget):
-    def __init__(self, cfg, parent=None):
-        super().__init__(parent); self._cfg, self.templates = cfg, []
-        self._build()
     def _build(self):
-        root = QHBoxLayout(self); root.setContentsMargins(0,8,0,0)
-        lp = QWidget(); lp.setObjectName("panel"); lp.setFixedWidth(300); ll = QVBoxLayout(lp)
-        self.p_in=PathRow("📂","照片目录"); self.p_out=PathRow("💾","输出目录")
-        ll.addWidget(sec("1. 路径设置")); ll.addWidget(self.p_in); ll.addWidget(self.p_out)
-        ll.addWidget(sec("2. 添加 Tab1 生成的透明模板")); bt = QHBoxLayout(); b_a=QPushButton("+添加"); b_a.setObjectName("btnGreen"); b_a.clicked.connect(self._add)
-        bt.addWidget(b_a,1); ll.addLayout(bt); self.lst = QListWidget(); ll.addWidget(self.lst)
-        sz=QHBoxLayout(); self.sp_w=QSpinBox(); self.sp_h=QSpinBox();
-        for sp in (self.sp_w,self.sp_h): sp.setRange(100,5000); sp.setValue(800)
-        sz.addWidget(QLabel("宽:")); sz.addWidget(self.sp_w); sz.addWidget(QLabel("高:")); sz.addWidget(self.sp_h)
-        ll.addLayout(sz); self.cb_stretch=QCheckBox("拉伸填满"); ll.addWidget(self.cb_stretch); ll.addStretch()
-        self.prog=QProgressBar(); self.prog.setTextVisible(False); ll.addWidget(self.prog); btn_go=QPushButton("🚀 开始智能填充"); btn_go.setObjectName("btnPrimary"); btn_go.clicked.connect(self._start)
-        ll.addWidget(btn_go); root.addWidget(lp); self.log = QTextEdit(); self.log.setReadOnly(True); root.addWidget(self.log, 1)
-    def _add(self): fs,_=QFileDialog.getOpenFileNames(self, filter="PNG (*.png)"); self.templates.extend(fs); self.lst.addItems([Path(x).name for x in fs])
-    def _start(self):
-        m = 'stretch' if self.cb_stretch.isChecked() else 'contain'
-        self._worker = MainBatchWorker(self.p_in.path(), self.p_out.path(), self.templates, self.sp_w.value(), self.sp_h.value(), 300, 95, m)
-        self._worker.sig_log.connect(lambda msg: self.log.append(msg))
-        self._worker.sig_prog.connect(lambda c,t: [self.prog.setMaximum(t), self.prog.setValue(c)])
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 8, 0, 0)
+        root.setSpacing(10)
+
+        # ── 左侧控制面板 ──
+        lp = QWidget()
+        lp.setObjectName("panel")
+        lp.setFixedWidth(300)
+        ll = QVBoxLayout(lp)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(0)
+
+        sc_a = QScrollArea()
+        sc_a.setWidgetResizable(True)
+        sc_a.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        inner = QWidget()
+        sl = QVBoxLayout(inner)
+        sl.setContentsMargins(14, 14, 10, 10)
+        sl.setSpacing(0)
+
+        # 相框图
+        sl.addWidget(sec("相框图  (PNG RGBA)"))
+        sl.addSpacing(8)
+        fr_row = QHBoxLayout()
+        fr_row.setSpacing(8)
+        self.lbl_fr = QLabel("未选择")
+        self.lbl_fr.setStyleSheet("color:#505068;font-size:11px;background:transparent;")
+        self.lbl_fr.setWordWrap(True)
+        btn_fr = QPushButton("选择")
+        btn_fr.setObjectName("btnGhost")
+        btn_fr.setFixedWidth(52)
+        btn_fr.clicked.connect(self._load_fr)
+        fr_row.addWidget(self.lbl_fr, 1)
+        fr_row.addWidget(btn_fr)
+        sl.addLayout(fr_row)
+        sl.addSpacing(16)
+        sl.addWidget(div())
+        sl.addSpacing(16)
+
+        # 预览背景图
+        sl.addWidget(sec("预览背景图"))
+        sl.addSpacing(8)
+        bg_row = QHBoxLayout()
+        bg_row.setSpacing(8)
+        self.lbl_bg = QLabel("未选择")
+        self.lbl_bg.setStyleSheet("color:#505068;font-size:11px;background:transparent;")
+        self.lbl_bg.setWordWrap(True)
+        btn_bg = QPushButton("选择")
+        btn_bg.setObjectName("btnGhost")
+        btn_bg.setFixedWidth(52)
+        btn_bg.clicked.connect(self._load_bg)
+        bg_row.addWidget(self.lbl_bg, 1)
+        bg_row.addWidget(btn_bg)
+        sl.addLayout(bg_row)
+        sl.addSpacing(14)
+
+        # 滑块行
+        def mk_sld_row(label):
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            l = QLabel(label)
+            l.setFixedWidth(44)
+            l.setStyleSheet("color:#606078;font-size:11.5px;background:transparent;")
+            sld = QSlider(Qt.Orientation.Horizontal)
+            sld.setRange(1, 99)
+            sld.setValue(50)
+            spn = QDoubleSpinBox()
+            spn.setRange(0.01, 0.99)
+            spn.setDecimals(3)
+            spn.setSingleStep(0.005)
+            spn.setValue(0.5)
+            row.addWidget(l)
+            row.addWidget(sld, 1)
+            row.addWidget(spn)
+            return row, sld, spn
+
+        r1, self.sld_cx,    self.spn_cx    = mk_sld_row("水平")
+        r2, self.sld_cy,    self.spn_cy    = mk_sld_row("垂直")
+        r3, self.sld_scale, self.spn_scale = mk_sld_row("大小")
+        self.sld_scale.setRange(5, 98)
+        self.spn_scale.setRange(0.05, 0.98)
+        self.sld_scale.setValue(40)
+        self.spn_scale.setValue(0.40)
+
+        def link(sld, spn, fn):
+            sld.valueChanged.connect(lambda v: [
+                spn.blockSignals(True), spn.setValue(v / 100), spn.blockSignals(False), fn()])
+            spn.valueChanged.connect(lambda v: [
+                sld.blockSignals(True), sld.setValue(int(round(v * 100))), sld.blockSignals(False), fn()])
+
+        link(self.sld_cx,    self.spn_cx,    self._apply)
+        link(self.sld_cy,    self.spn_cy,    self._apply)
+        link(self.sld_scale, self.spn_scale, self._apply)
+
+        for r in (r1, r2, r3):
+            sl.addLayout(r)
+            sl.addSpacing(5)
+
+        self.lbl_pos = QLabel("—")
+        self.lbl_pos.setStyleSheet("color:#303048;font-size:10.5px;background:transparent;")
+        sl.addSpacing(4)
+        sl.addWidget(self.lbl_pos)
+        sl.addSpacing(16)
+        sl.addWidget(div())
+        sl.addSpacing(16)
+
+        # 批量背景图
+        sl.addWidget(sec("批量背景图"))
+        sl.addSpacing(8)
+        add_row = QHBoxLayout()
+        add_row.setSpacing(8)
+        btn_add = QPushButton("＋ 添加")
+        btn_add.setObjectName("btnGreen")
+        btn_add.setFixedHeight(32)
+        btn_clr = QPushButton("清空")
+        btn_clr.setObjectName("btnRed")
+        btn_clr.setFixedHeight(32)
+        btn_clr.setFixedWidth(100)
+        btn_add.clicked.connect(self._add_batch)
+        btn_clr.clicked.connect(self._clear_batch)
+        add_row.addWidget(btn_add, 1)
+        add_row.addWidget(btn_clr)
+        sl.addLayout(add_row)
+        sl.addSpacing(8)
+
+        self.lst = QListWidget()
+        self.lst.setFixedHeight(110)
+        self.lst.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        sl.addWidget(self.lst)
+
+        self.lbl_count = QLabel("0 张")
+        self.lbl_count.setStyleSheet("color:#303048;font-size:10.5px;background:transparent;")
+        sl.addSpacing(4)
+        sl.addWidget(self.lbl_count)
+        sl.addStretch()
+
+        sc_a.setWidget(inner)
+        ll.addWidget(sc_a, 1)
+
+        # 底部按钮
+        bot = QWidget()
+        bot.setStyleSheet("background:transparent;")
+        bl = QVBoxLayout(bot)
+        bl.setContentsMargins(14, 8, 14, 12)
+        bl.setSpacing(6)
+        self.prog = QProgressBar()
+        self.prog.setFixedHeight(4)
+        self.prog.setTextVisible(False)
+        self.prog.setVisible(False)
+        self.btn_run = QPushButton("🚀  生成透明模板 PNG")
+        self.btn_run.setObjectName("btnPrimary")
+        self.btn_run.setEnabled(False)
+        self.btn_run.clicked.connect(self._run)
+        bl.addWidget(self.prog)
+        bl.addWidget(self.btn_run)
+        ll.addWidget(bot)
+        root.addWidget(lp)
+
+        # ── 右侧预览 ──
+        rp = QWidget()
+        rl = QVBoxLayout(rp)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(6)
+        ph = QHBoxLayout()
+        plbl = QLabel("PREVIEW")
+        plbl.setStyleSheet("color:#1e1e2e;font-size:10px;font-weight:700;letter-spacing:2px;background:transparent;")
+        self.btn_save_one = QPushButton("💾 保存当前")
+        self.btn_save_one.setObjectName("btnGhost")
+        self.btn_save_one.setEnabled(False)
+        self.btn_save_one.clicked.connect(self._save_one)
+        ph.addWidget(plbl)
+        ph.addStretch()
+        ph.addWidget(self.btn_save_one)
+        rl.addLayout(ph)
+        self.canvas = PreviewCanvas()
+        self.canvas.pos_changed.connect(self._on_drag)
+        rl.addWidget(self.canvas, 1)
+        root.addWidget(rp, 1)
+
+    def _restore(self):
+        c = self._cfg
+        if c.get("t1_fr") and Path(c["t1_fr"]).exists():
+            self._load_fr_path(c["t1_fr"])
+        if c.get("t1_bg") and Path(c["t1_bg"]).exists():
+            self._load_bg_path(c["t1_bg"])
+        for sld, spn, key, default in [
+            (self.sld_cx,    self.spn_cx,    "t1_cx",    50),
+            (self.sld_cy,    self.spn_cy,    "t1_cy",    50),
+            (self.sld_scale, self.spn_scale, "t1_scale", 40),
+        ]:
+            v = int(c.get(key, default))
+            sld.blockSignals(True); sld.setValue(v); sld.blockSignals(False)
+            spn.blockSignals(True); spn.setValue(v / 100); spn.blockSignals(False)
+        if c.get("t1_batch"):
+            for p in c["t1_batch"]:
+                if Path(p).exists() and p not in self._batch_paths:
+                    self._batch_paths.append(p)
+                    self.lst.addItem(Path(p).name)
+            self.lbl_count.setText(f"{len(self._batch_paths)} 张")
+        self._refresh_btn()
+
+    def _save_state(self):
+        self._cfg.update({
+            "t1_cx":    self.sld_cx.value(),
+            "t1_cy":    self.sld_cy.value(),
+            "t1_scale": self.sld_scale.value(),
+            "t1_batch": self._batch_paths,
+        })
+        save_cfg(self._cfg)
+
+    def _load_fr(self):
+        p, _ = QFileDialog.getOpenFileName(self, "选择相框图", filter="PNG (*.png);;所有文件 (*.*)")
+        if p:
+            self._load_fr_path(p)
+
+    def _load_fr_path(self, p):
+        self._fr_rgba = Image.open(p).convert("RGBA")
+        self.lbl_fr.setText(Path(p).name)
+        self._cfg["t1_fr"] = p
+        save_cfg(self._cfg)
+        self._refresh_btn()
+        if self._bg_pil:
+            self.canvas.set_images(self._bg_pil, self._fr_rgba)
+            self._apply()
+
+    def _load_bg(self):
+        p, _ = QFileDialog.getOpenFileName(self, "选择预览背景图",
+                                           filter="图片 (*.jpg *.jpeg *.png *.webp *.bmp);;所有文件 (*.*)")
+        if p:
+            self._load_bg_path(p)
+
+    def _load_bg_path(self, p):
+        self._bg_pil = Image.open(p).convert("RGB")
+        self.lbl_bg.setText(Path(p).name)
+        self._cfg["t1_bg"] = p
+        save_cfg(self._cfg)
+        self.btn_save_one.setEnabled(True)
+        self.canvas.set_images(self._bg_pil, self._fr_rgba)
+        self._apply()
+
+    def _apply(self):
+        cx = self.sld_cx.value() / 100
+        cy = self.sld_cy.value() / 100
+        sc = self.sld_scale.value() / 100
+        self.canvas.set_placement(cx, cy, sc)
+        self.lbl_pos.setText(f"水平 {cx:.3f}  垂直 {cy:.3f}  大小 {sc:.3f}")
+        self._save_state()
+
+    def _on_drag(self, cx, cy):
+        for sld, spn, v in [
+            (self.sld_cx, self.spn_cx, int(cx * 100)),
+            (self.sld_cy, self.spn_cy, int(cy * 100)),
+        ]:
+            sld.blockSignals(True); sld.setValue(v); sld.blockSignals(False)
+            spn.blockSignals(True); spn.setValue(v / 100); spn.blockSignals(False)
+        self._apply()
+
+    def _add_batch(self):
+        ps, _ = QFileDialog.getOpenFileNames(
+            self, "添加背景图（可多选）",
+            filter="图片 (*.jpg *.jpeg *.png *.webp *.bmp);;所有文件 (*.*)")
+        for p in ps:
+            if p not in self._batch_paths:
+                self._batch_paths.append(p)
+                self.lst.addItem(Path(p).name)
+        self.lbl_count.setText(f"{len(self._batch_paths)} 张")
+        self._refresh_btn()
+        self._save_state()
+
+    def _clear_batch(self):
+        self._batch_paths.clear()
+        self.lst.clear()
+        self.lbl_count.setText("0 张")
+        self._refresh_btn()
+        self._save_state()
+
+    def _refresh_btn(self):
+        self.btn_run.setEnabled(self._fr_rgba is not None and len(self._batch_paths) > 0)
+
+    def _run(self):
+        out = QFileDialog.getExistingDirectory(self, "选择输出文件夹")
+        if not out:
+            return
+        self.btn_run.setEnabled(False)
+        self.prog.setVisible(True)
+        self.prog.setMaximum(len(self._batch_paths))
+        self.prog.setValue(0)
+        self._worker = FrameBatchWorker(
+            self._batch_paths, self._fr_rgba,
+            self.sld_cx.value() / 100,
+            self.sld_cy.value() / 100,
+            self.sld_scale.value() / 100,
+            out)
+        self._worker.sig_progress.connect(
+            lambda i, n: (self.prog.setValue(i), self.lst.setCurrentRow(i - 1)))
+        self._worker.sig_done.connect(self._on_done)
         self._worker.start()
 
+    def _on_done(self, saved):
+        self.btn_run.setEnabled(True)
+        self.prog.setVisible(False)
+        QMessageBox.information(self, "完成", f"已生成 {saved} 个透明模板 PNG")
+
+    def _save_one(self):
+        if not self._bg_pil or not self._fr_rgba:
+            return
+        p, _ = QFileDialog.getSaveFileName(self, "保存预览结果", "模板预览.png", "PNG (*.png)")
+        if not p:
+            return
+        r = composite_tab1(
+            self._bg_pil, self._fr_rgba,
+            self.sld_cx.value() / 100,
+            self.sld_cy.value() / 100,
+            self.sld_scale.value() / 100)
+        r.save(p, "PNG")
+
+
+# ==============================================================================
+# Tab2：主图批量合成
+# ==============================================================================
+class MainTab(QWidget):
+    _LC = {
+        "✅": "#4ade80", "❌": "#f87171", "⚠️": "#fbbf24",
+        "🚀": "#38bdf8", "──": "#303040", "🏁": "#c084fc", "🖼": "#818cf8"
+    }
+
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self._cfg = cfg
+        self.templates: List[str] = []
+        self._worker = None
+        self._build()
+        self._restore()
+
+    def _build(self):
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 8, 0, 0)
+        root.setSpacing(10)
+
+        # ── 左侧控制面板 ──
+        lp = QWidget()
+        lp.setObjectName("panel")
+        lp.setFixedWidth(300)
+        ll = QVBoxLayout(lp)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(0)
+
+        sc_a = QScrollArea()
+        sc_a.setWidgetResizable(True)
+        sc_a.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        inner = QWidget()
+        sl = QVBoxLayout(inner)
+        sl.setContentsMargins(14, 14, 10, 10)
+        sl.setSpacing(0)
+
+        # 路径
+        sl.addWidget(sec("路  径"))
+        sl.addSpacing(8)
+        self.row_in  = PathRow("📂", "输入文件夹（照片）")
+        self.row_out = PathRow("💾", "输出文件夹")
+        sl.addWidget(self.row_in)
+        sl.addSpacing(6)
+        sl.addWidget(self.row_out)
+        sl.addSpacing(16)
+        sl.addWidget(div())
+        sl.addSpacing(16)
+
+        # 模板列表
+        sl.addWidget(sec("PNG 透明模板  (Tab1 生成)"))
+        sl.addSpacing(8)
+        bt = QHBoxLayout()
+        bt.setSpacing(8)
+        self.btn_add_tpl = QPushButton("＋ 添加")
+        self.btn_add_tpl.setObjectName("btnGreen")
+        self.btn_add_tpl.setFixedHeight(32)
+        self.btn_del_tpl = QPushButton("－ 删除")
+        self.btn_del_tpl.setObjectName("btnRed")
+        self.btn_del_tpl.setFixedHeight(32)
+        self.btn_add_tpl.clicked.connect(self._add_tpl)
+        self.btn_del_tpl.clicked.connect(self._del_tpl)
+        bt.addWidget(self.btn_add_tpl, 1)
+        bt.addWidget(self.btn_del_tpl, 1)
+        sl.addLayout(bt)
+        sl.addSpacing(8)
+        self.tpl_list = QListWidget()
+        self.tpl_list.setFixedHeight(110)
+        self.tpl_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        sl.addWidget(self.tpl_list)
+        sl.addSpacing(16)
+        sl.addWidget(div())
+        sl.addSpacing(16)
+
+        # 输出规格
+        sl.addWidget(sec("输出规格"))
+        sl.addSpacing(8)
+        self.cmb = QComboBox()
+        for p in ["正方形  800×800", "正方形  1000×1000", "正方形  1200×1200",
+                  "竖版 5:7  1500×2100", "横版 7:5  2100×1500", "自定义…"]:
+            self.cmb.addItem(p)
+        self.cmb.currentIndexChanged.connect(self._on_preset)
+        self.cmb.wheelEvent = lambda e: e.ignore()
+        sl.addWidget(self.cmb)
+        sl.addSpacing(10)
+
+        def mk(lo, hi, val, suf):
+            s = QSpinBox()
+            s.setRange(lo, hi)
+            s.setValue(val)
+            s.setSuffix(suf)
+            s.wheelEvent = lambda e: e.ignore()
+            return s
+
+        self.spn_w   = mk(100, 9999, 800, " px")
+        self.spn_h   = mk(100, 9999, 800, " px")
+        self.spn_dpi = mk(72,  600,  300, " DPI")
+        self.spn_q   = mk(80,  100,  95,  " %")
+
+        def lw(txt, w):
+            wr = QWidget()
+            r  = QHBoxLayout(wr)
+            r.setContentsMargins(0, 0, 0, 0)
+            r.setSpacing(6)
+            l = QLabel(txt)
+            l.setFixedWidth(28)
+            l.setStyleSheet("color:#606070;font-size:11px;background:transparent;")
+            r.addWidget(l)
+            r.addWidget(w, 1)
+            return wr
+
+        g1 = QHBoxLayout(); g1.setSpacing(10)
+        g2 = QHBoxLayout(); g2.setSpacing(10)
+        g1.addWidget(lw("宽",   self.spn_w),   1)
+        g1.addWidget(lw("高",   self.spn_h),   1)
+        g2.addWidget(lw("DPI",  self.spn_dpi), 1)
+        g2.addWidget(lw("品质", self.spn_q),   1)
+        sl.addLayout(g1)
+        sl.addSpacing(8)
+        sl.addLayout(g2)
+        sl.addSpacing(10)
+
+        self.chk_png = QCheckBox("输出 PNG（保留透明通道）")
+        self.chk_png.setStyleSheet("color:#9090a8;font-size:12px;")
+        sl.addWidget(self.chk_png)
+        sl.addStretch()
+
+        sc_a.setWidget(inner)
+        ll.addWidget(sc_a, 1)
+
+        # 底部按钮
+        bot = QWidget()
+        bot.setStyleSheet("background:transparent;")
+        bl = QVBoxLayout(bot)
+        bl.setContentsMargins(14, 8, 14, 12)
+        bl.setSpacing(6)
+        self.prog = QProgressBar()
+        self.prog.setFixedHeight(4)
+        self.prog.setTextVisible(False)
+        self.btn_start = QPushButton("🚀  开始批量合成主图")
+        self.btn_start.setObjectName("btnPrimary")
+        self.btn_start.clicked.connect(self._start)
+        bl.addWidget(self.prog)
+        bl.addWidget(self.btn_start)
+        ll.addWidget(bot)
+        root.addWidget(lp)
+
+        # ── 右侧日志 ──
+        rp = QWidget()
+        rp.setObjectName("rpanel")
+        rl = QVBoxLayout(rp)
+        rl.setContentsMargins(14, 14, 14, 14)
+        rl.setSpacing(10)
+        lh = QHBoxLayout()
+        lh.addWidget(sec("处 理 日 志"))
+        lh.addStretch()
+        bc = QPushButton("清空")
+        bc.setObjectName("btnClear")
+        bc.clicked.connect(lambda: self.log_box.clear())
+        lh.addWidget(bc)
+        rl.addLayout(lh)
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setPlaceholderText("日志将在这里实时显示…")
+        rl.addWidget(self.log_box, 1)
+        root.addWidget(rp, 1)
+
+    def _restore(self):
+        c = self._cfg
+        if c.get("t2_inp"):  self.row_in.set_path(c["t2_inp"])
+        if c.get("t2_out"):  self.row_out.set_path(c["t2_out"])
+        if c.get("t2_size"): self.cmb.setCurrentIndex(c["t2_size"])
+        if c.get("t2_dpi"):  self.spn_dpi.setValue(c["t2_dpi"])
+        if c.get("t2_q"):    self.spn_q.setValue(c["t2_q"])
+        if c.get("t2_png"):  self.chk_png.setChecked(c["t2_png"])
+        if c.get("t2_tpls"):
+            for f in c["t2_tpls"]:
+                if Path(f).exists() and f not in self.templates:
+                    self.templates.append(f)
+                    self.tpl_list.addItem(QListWidgetItem(f"  {Path(f).name}"))
+
+    def _save_state(self):
+        self._cfg.update({
+            "t2_inp":  self.row_in.path(),
+            "t2_out":  self.row_out.path(),
+            "t2_size": self.cmb.currentIndex(),
+            "t2_dpi":  self.spn_dpi.value(),
+            "t2_q":    self.spn_q.value(),
+            "t2_png":  self.chk_png.isChecked(),
+            "t2_tpls": self.templates,
+        })
+        save_cfg(self._cfg)
+
+    _P = {0: (800, 800), 1: (1000, 1000), 2: (1200, 1200), 3: (1500, 2100), 4: (2100, 1500)}
+
+    def _on_preset(self, idx):
+        if idx in self._P:
+            w, h = self._P[idx]
+            for s, v in [(self.spn_w, w), (self.spn_h, h)]:
+                s.blockSignals(True); s.setValue(v); s.blockSignals(False)
+
+    def _add_tpl(self):
+        fs, _ = QFileDialog.getOpenFileNames(
+            self, "选择 PNG 模板", filter="PNG (*.png);;所有文件 (*.*)")
+        for f in fs:
+            if f not in self.templates:
+                self.templates.append(f)
+                self.tpl_list.addItem(QListWidgetItem(f"  {Path(f).name}"))
+        self._save_state()
+
+    def _del_tpl(self):
+        for item in reversed(self.tpl_list.selectedItems()):
+            r = self.tpl_list.row(item)
+            self.tpl_list.takeItem(r)
+            self.templates.pop(r)
+        self._save_state()
+
+    def _log(self, msg):
+        color = "#606072"
+        for k, c in self._LC.items():
+            if msg.startswith(k):
+                color = c
+                break
+        self.log_box.append(
+            f'<span style="color:{color};font-family:Consolas,monospace;">{msg}</span>')
+        self.log_box.verticalScrollBar().setValue(
+            self.log_box.verticalScrollBar().maximum())
+
+    def _on_prog(self, cur, total):
+        self.prog.setMaximum(total)
+        self.prog.setValue(cur)
+
+    def _on_done(self, ok, fail):
+        self.btn_start.setEnabled(True)
+        self.btn_start.setText("🚀  开始批量合成主图")
+        self.prog.setValue(self.prog.maximum())
+        self._log(f"\n🏁  完成 — 成功 {ok} 张  失败 {fail} 张")
+        out = self.row_out.path()
+        (QMessageBox.information if fail == 0 else QMessageBox.warning)(
+            self, "完成",
+            f"成功合成 {ok} 张\n\n输出目录：\n{out}" if fail == 0
+            else f"成功 {ok}  失败 {fail}\n\n{out}")
+
+    def _start(self):
+        inp = self.row_in.path()
+        out = self.row_out.path()
+        if not inp or not os.path.isdir(inp):
+            QMessageBox.warning(self, "提示", "请选择输入文件夹")
+            return
+        if not out:
+            QMessageBox.warning(self, "提示", "请选择输出文件夹")
+            return
+        if not self.templates:
+            QMessageBox.warning(self, "提示", "请添加 PNG 模板")
+            return
+        files = [f for f in Path(inp).iterdir()
+                 if f.suffix.lower() in SUPPORTED_EXT and not f.name.startswith("主图_")]
+        if not files:
+            QMessageBox.warning(self, "提示", "未找到图片")
+            return
+        n = len(files)
+        self.prog.setValue(0)
+        self.prog.setMaximum(n)
+        self.btn_start.setEnabled(False)
+        self.btn_start.setText("合成中…")
+        self._log(f"🚀  开始  {n} 张 · {len(self.templates)} 个模板")
+        self._save_state()
+        self._worker = MainBatchWorker(
+            inp, out, self.templates,
+            self.spn_w.value(), self.spn_h.value(),
+            self.spn_dpi.value(), self.spn_q.value(),
+            self.chk_png.isChecked())
+        self._worker.sig_log.connect(self._log)
+        self._worker.sig_prog.connect(self._on_prog)
+        self._worker.sig_done.connect(self._on_done)
+        self._worker.start()
+
+
+# ==============================================================================
+# 主窗口
+# ==============================================================================
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.setWindowTitle("透明通道闭环填充工具 - 矩形精准版"); self.resize(1100, 750); self._cfg = load_cfg()
-        root = QWidget(); self.setCentralWidget(root); rl = QVBoxLayout(root)
-        self.tabs = QTabWidget(); self.tab1 = FrameTab(self._cfg); self.tab2 = MainTab(self._cfg)
-        self.tabs.addTab(self.tab1, " 📐 Tab1 相框背景合成 "); self.tabs.addTab(self.tab2, " 🖼 Tab2 主图智能填充 ")
-        rl.addWidget(self.tabs); self.setStyleSheet(QSS)
-    def closeEvent(self, e): save_cfg(self._cfg); super().closeEvent(e)
+        super().__init__()
+        self.setWindowTitle("照片处理工具")
+        self.setMinimumSize(900, 620)
+        self.resize(1120, 730)
+        self._cfg = load_cfg()
+        self._build_ui()
+        self.setStyleSheet(QSS)
+        self.setStatusBar(QStatusBar())
+        self.statusBar().showMessage(
+            "Tab1：调好位置生成透明模板 PNG  →  Tab2：批量填入照片合成主图")
+
+    def _build_ui(self):
+        root = QWidget()
+        root.setObjectName("root")
+        self.setCentralWidget(root)
+        rl = QVBoxLayout(root)
+        rl.setContentsMargins(14, 12, 14, 10)
+        rl.setSpacing(10)
+
+        hdr = QHBoxLayout()
+        t = QLabel("照片处理工具")
+        t.setStyleSheet("color:#dddde8;font-size:16px;font-weight:700;")
+        s = QLabel("相框模板生成  ·  主图智能合成")
+        s.setStyleSheet("color:#28283a;font-size:11px;")
+        hdr.addWidget(t)
+        hdr.addStretch()
+        hdr.addWidget(s)
+        rl.addLayout(hdr)
+
+        ln = QFrame()
+        ln.setObjectName("div")
+        ln.setFrameShape(QFrame.Shape.HLine)
+        rl.addWidget(ln)
+
+        self.tabs = QTabWidget()
+        self.tab1 = FrameTab(self._cfg)
+        self.tab2 = MainTab(self._cfg)
+        self.tabs.addTab(self.tab1, "  📐  Tab1 · 相框模板生成  ")
+        self.tabs.addTab(self.tab2, "  🖼   Tab2 · 主图批量合成  ")
+        rl.addWidget(self.tabs, 1)
+
+    def closeEvent(self, e):
+        save_cfg(self._cfg)
+        super().closeEvent(e)
+
+
+# ==============================================================================
+# 入口
+# ==============================================================================
+def main():
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ralo.photo_tool.v2")
+        except Exception:
+            pass
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+
+    p = QPalette()
+    p.setColor(QPalette.ColorRole.Window,          QColor(17, 17, 19))
+    p.setColor(QPalette.ColorRole.WindowText,      QColor(221, 221, 229))
+    p.setColor(QPalette.ColorRole.Base,            QColor(14, 14, 18))
+    p.setColor(QPalette.ColorRole.Text,            QColor(200, 200, 212))
+    p.setColor(QPalette.ColorRole.Button,          QColor(28, 28, 34))
+    p.setColor(QPalette.ColorRole.ButtonText,      QColor(200, 200, 212))
+    p.setColor(QPalette.ColorRole.Highlight,       QColor(10, 132, 255))
+    p.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
+    app.setPalette(p)
+
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
+
 
 if __name__ == "__main__":
-    if sys.platform == "win32": ctypes.windll.user32.SetProcessDPIAware()
-    app = QApplication(sys.argv); app.setStyle("Fusion"); win = MainWindow(); win.show(); sys.exit(app.exec())
+    main()

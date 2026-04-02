@@ -95,43 +95,80 @@ QScrollBar::handle:vertical { background: #282838; border-radius: 2px; min-heigh
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 """
 
-# ==============================================================================
-# 新增：红框解析与擦除函数
-# ==============================================================================
-def parse_red_box(img_rgba: Image.Image) -> Tuple[Optional[Tuple[int,int,int,int]], Image.Image]:
-    """
-    寻找图像中的纯红色矩形框。
-    如果找到，返回 (坐标, 擦除红线后的图像)，否则返回 (None, 原图像)
-    """
+def parse_red_box(img_rgba: Image.Image, shrink: int = 2):
     arr = np.array(img_rgba)
     if arr.shape[2] < 4:
         return None, img_rgba
 
-    # 分离通道，并转为 int 防止溢出
-    r = arr[:,:,0].astype(int)
-    g = arr[:,:,1].astype(int)
-    b = arr[:,:,2].astype(int)
+    r = arr[:,:,0].astype(float)
+    g = arr[:,:,1].astype(float)
+    b = arr[:,:,2].astype(float)
     a = arr[:,:,3].astype(int)
 
-    # 判定规则：R值较高，且明显大于G和B，且非完全透明
-    red_mask = (r > 150) & (r > g * 2) & (r > b * 2) & (a > 20)
+    r01 = r / 255.0
+    g01 = g / 255.0
+    b01 = b / 255.0
+
+    maxc = np.maximum(np.maximum(r01, g01), b01)
+    minc = np.minimum(np.minimum(r01, g01), b01)
+    delta = maxc - minc
+
+    s = np.where(maxc > 0, delta / maxc, 0.0)
+    v = maxc
+
+    h = np.zeros_like(r01)
+    mask_r = (maxc == r01) & (delta > 0)
+    h[mask_r] = (60 * ((g01[mask_r] - b01[mask_r]) / delta[mask_r])) % 360
+
+    red_mask = (
+            ((h <= 18) | (h >= 342)) &
+            (s > 0.55) &
+            (v > 0.35) &
+            (a > 20)
+    )
 
     if not red_mask.any():
         return None, img_rgba
 
-    ys, xs = np.where(red_mask)
-    x1, y1 = int(xs.min()), int(ys.min())
-    x2, y2 = int(xs.max()) + 1, int(ys.max()) + 1
+    if SCIPY_OK:
+        labeled, num = scipy_label(red_mask)
+        if num == 0:
+            return None, img_rgba
+        sizes = np.bincount(labeled.ravel())
+        sizes[0] = 0
+        target = np.argmax(sizes)
+        clean_mask = (labeled == target)
+    else:
+        clean_mask = red_mask
 
-    # 核心：将所有被判定为“红线”的像素 Alpha 设为 0（变透明）
-    arr[red_mask, 3] = 0
-    cleaned_img = Image.fromarray(arr, 'RGBA')
+    h_img, w_img = arr.shape[:2]
+    if clean_mask.sum() < w_img * h_img * 0.005:
+        log.info("   红色区域太小，可能误检，跳过")
+        return None, img_rgba
+
+    ys, xs = np.where(clean_mask)
+    x1_outer = int(xs.min())
+    y1_outer = int(ys.min())
+    x2_outer = int(xs.max()) + 1
+    y2_outer = int(ys.max()) + 1
+
+    x1 = min(x1_outer + shrink, x2_outer)
+    y1 = min(y1_outer + shrink, y2_outer)
+    x2 = max(x2_outer - shrink, x1_outer)
+    y2 = max(y2_outer - shrink, y1_outer)
+
+    if x2 <= x1 or y2 <= y1:
+        log.warning("   收缩后区域无效，使用外框")
+        x1, y1, x2, y2 = x1_outer, y1_outer, x2_outer, y2_outer
+
+    log.info(f"   🎯 红框检测成功：外框({x1_outer},{y1_outer})-({x2_outer},{y2_outer})  净填充({x1},{y1})-({x2},{y2})")
+
+    out_arr = arr.copy()
+    out_arr[clean_mask, 3] = 0
+    cleaned_img = Image.fromarray(out_arr, 'RGBA')
 
     return (x1, y1, x2, y2), cleaned_img
 
-# ==============================================================================
-# 备用：原有透明孔洞识别 (当没有画红框时触发)
-# ==============================================================================
 def find_main_hole_fallback(tpl_rgba: Image.Image) -> Tuple[int,int,int,int]:
     arr = np.array(tpl_rgba)
     h_img, w_img = arr.shape[:2]
@@ -176,21 +213,17 @@ def composite_tab1(bg: Image.Image, frame_rgba: Image.Image, cx: float, cy: floa
     fh = int(frame_rgba.height * fw / frame_rgba.width)
     if fw <= 0 or fh <= 0: return bg.convert("RGBA")
 
-    # 1. 优先解析红框，如果存在则直接用它的坐标，并擦除红线
     box, cleaned_frame = parse_red_box(frame_rgba)
 
-    # 用擦除过红线的干净相框进行缩放
     fr = cleaned_frame.resize((fw, fh), Image.LANCZOS)
     left = max(0, min(int(cx*bw - fw/2), bw-fw))
     top  = max(0, min(int(cy*bh - fh/2), bh-fh))
 
     out = bg.convert("RGBA").copy()
 
-    # 2. 计算最终需要挖孔的坐标
     if box:
         orig_w, orig_h = frame_rgba.size
         x1, y1, x2, y2 = box
-        # 将原图红框坐标按比例缩放
         hx1 = int(x1 * fw / orig_w)
         hy1 = int(y1 * fh / orig_h)
         hx2 = int(x2 * fw / orig_w)
@@ -201,36 +234,32 @@ def composite_tab1(bg: Image.Image, frame_rgba: Image.Image, cx: float, cy: floa
     hole_w = hx2 - hx1
     hole_h = hy2 - hy1
     if hole_w > 0 and hole_h > 0:
-        # 只在这个严格指定的区域制造透明
         transparent_hole = Image.new("RGBA", (hole_w, hole_h), (0, 0, 0, 0))
         out.paste(transparent_hole, (left + hx1, top + hy1))
 
-    # 贴上相框。如果是夹层透明，此时背后的 bg 还没被挖空，所以夹层依然是 bg
     out.paste(fr, (left, top), fr)
     return out
 
-def composite_tab2(photo: Image.Image, tpl_path: str, out_w: int, out_h: int, dpi: int, logger=None) -> Image.Image:
+def composite_tab2(photo, tpl_path, out_w, out_h, dpi, logger=None):
     tpl_orig = Image.open(tpl_path)
-    if tpl_orig.mode != "RGBA":
-        tpl = tpl_orig.convert("RGBA")
-    else:
-        tpl = tpl_orig.copy()
-
+    tpl = tpl_orig.convert("RGBA") if tpl_orig.mode != "RGBA" else tpl_orig.copy()
     tw, th = tpl.size
 
-    # 同样优先检测红框（兼容用户直接在模板里画红框的做法）
     box, cleaned_tpl = parse_red_box(tpl)
+
     if box:
         x1, y1, x2, y2 = box
-        tpl = cleaned_tpl # 使用被擦除红线的干净模板叠加
-        if logger: logger("   🎯 检测到人工红色标注框")
+        tpl = cleaned_tpl
+        if logger: logger(f"   🎯 红框净填充区域：({x1},{y1})-({x2},{y2})  {x2-x1}×{y2-y1}px")
     else:
         x1, y1, x2, y2 = find_main_hole_fallback(tpl)
+        if logger: logger("   ⚠️  未检测到红框，使用透明孔洞识别")
 
     box_w = x2 - x1
     box_h = y2 - y1
 
     if box_w <= 0 or box_h <= 0:
+        if logger: logger("   ❌  填充区域宽高为0，跳过")
         x1, y1, box_w, box_h = 0, 0, tw, th
 
     filled = photo_cover_fill(photo.convert("RGBA"), box_w, box_h)
@@ -238,7 +267,6 @@ def composite_tab2(photo: Image.Image, tpl_path: str, out_w: int, out_h: int, dp
     canvas = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
     canvas.paste(filled, (x1, y1))
 
-    # alpha叠加，因为红线已经被干净地擦掉了，这里也不会现形
     result = Image.alpha_composite(canvas, tpl)
     result = result.resize((out_w, out_h), Image.LANCZOS)
     return result
@@ -349,7 +377,7 @@ class PreviewCanvas(QLabel):
         self.setMinimumSize(380, 280)
         self.setStyleSheet("background:#0e0e16;border-radius:10px;border:1px solid #1e1e2c;")
         self._bg = self._fr = None
-        self._cx = 0.5; self._cy = 0.5; self._sc = 0.4
+        self._cx = 0.5; self._cy = 0.515; self._sc = 0.630
         self._dragging = False; self._dr = (0,0,1,1)
         self._buf = None
         ph = QLabel("请先选相框图和预览背景图", self)
@@ -443,7 +471,10 @@ class FrameTab(QWidget):
         r2,self.sld_cy,   self.spn_cy    = mk_sld_row("垂直")
         r3,self.sld_scale,self.spn_scale = mk_sld_row("大小")
         self.sld_scale.setRange(5, 98); self.spn_scale.setRange(0.05, 0.98)
-        self.sld_scale.setValue(40); self.spn_scale.setValue(0.40)
+
+        self.sld_cx.setValue(50); self.spn_cx.setValue(0.500)
+        self.sld_cy.setValue(52); self.spn_cy.setValue(0.515)
+        self.sld_scale.setValue(63); self.spn_scale.setValue(0.630)
 
         for r in (r1, r2, r3): sl.addLayout(r); sl.addSpacing(5)
 
@@ -503,14 +534,16 @@ class FrameTab(QWidget):
         c = self._cfg
         if c.get("t1_fr") and Path(c["t1_fr"]).exists():  self._load_fr_path(c["t1_fr"])
         if c.get("t1_bg") and Path(c["t1_bg"]).exists():  self._load_bg_path(c["t1_bg"])
+
         for sld, spn, key, default in [
             (self.sld_cx,    self.spn_cx,    "t1_cx",    50),
-            (self.sld_cy,    self.spn_cy,    "t1_cy",    50),
-            (self.sld_scale, self.spn_scale, "t1_scale", 40),
+            (self.sld_cy,    self.spn_cy,    "t1_cy",    51.5),
+            (self.sld_scale, self.spn_scale, "t1_scale", 63),
         ]:
-            v = int(c.get(key, default))
-            sld.blockSignals(True); sld.setValue(v); sld.blockSignals(False)
-            spn.blockSignals(True); spn.setValue(v/100); spn.blockSignals(False)
+            v = float(c.get(key, default))
+            sld.blockSignals(True); sld.setValue(int(round(v))); sld.blockSignals(False)
+            spn.blockSignals(True); spn.setValue(v/100 if v > 1 else v); spn.blockSignals(False)
+
         if c.get("t1_batch"):
             for p in c["t1_batch"]:
                 if Path(p).exists() and p not in self._batch_paths:
@@ -520,9 +553,9 @@ class FrameTab(QWidget):
 
     def _save_state(self):
         self._cfg.update({
-            "t1_cx":    self.sld_cx.value(),
-            "t1_cy":    self.sld_cy.value(),
-            "t1_scale": self.sld_scale.value(),
+            "t1_cx":    self.spn_cx.value()*100,
+            "t1_cy":    self.spn_cy.value()*100,
+            "t1_scale": self.spn_scale.value()*100,
             "t1_batch": self._batch_paths,
         }); save_cfg(self._cfg)
 
@@ -550,15 +583,15 @@ class FrameTab(QWidget):
         self.canvas.set_images(self._bg_pil, self._fr_rgba); self._apply()
 
     def _apply(self):
-        cx = self.sld_cx.value()/100; cy = self.sld_cy.value()/100; sc = self.sld_scale.value()/100
+        cx = self.spn_cx.value(); cy = self.spn_cy.value(); sc = self.spn_scale.value()
         self.canvas.set_placement(cx, cy, sc)
         self.lbl_pos.setText(f"水平 {cx:.3f}  垂直 {cy:.3f}  大小 {sc:.3f}")
         self._save_state()
 
     def _on_drag(self, cx, cy):
-        for sld, spn, v in [(self.sld_cx,self.spn_cx,int(cx*100)),(self.sld_cy,self.spn_cy,int(cy*100))]:
-            sld.blockSignals(True); sld.setValue(v); sld.blockSignals(False)
-            spn.blockSignals(True); spn.setValue(v/100); spn.blockSignals(False)
+        for sld, spn, v in [(self.sld_cx,self.spn_cx,cx),(self.sld_cy,self.spn_cy,cy)]:
+            sld.blockSignals(True); sld.setValue(int(round(v*100))); sld.blockSignals(False)
+            spn.blockSignals(True); spn.setValue(v); spn.blockSignals(False)
         self._apply()
 
     def _add_batch(self):
@@ -583,7 +616,7 @@ class FrameTab(QWidget):
         self.prog.setMaximum(len(self._batch_paths)); self.prog.setValue(0)
         self._worker = FrameBatchWorker(
             self._batch_paths, self._fr_rgba,
-            self.sld_cx.value()/100, self.sld_cy.value()/100, self.sld_scale.value()/100, out)
+            self.spn_cx.value(), self.spn_cy.value(), self.spn_scale.value(), out)
         self._worker.sig_progress.connect(lambda i,n: (self.prog.setValue(i), self.lst.setCurrentRow(i-1)))
         self._worker.sig_done.connect(self._on_done)
         self._worker.start()
@@ -597,7 +630,7 @@ class FrameTab(QWidget):
         p, _ = QFileDialog.getSaveFileName(self, "保存预览结果", "模板预览.png", "PNG (*.png)")
         if not p: return
         r = composite_tab1(self._bg_pil, self._fr_rgba,
-                           self.sld_cx.value()/100, self.sld_cy.value()/100, self.sld_scale.value()/100)
+                           self.spn_cx.value(), self.spn_cy.value(), self.spn_scale.value())
         r.save(p, "PNG")
 
 class MainTab(QWidget):

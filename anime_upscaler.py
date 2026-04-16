@@ -3,6 +3,7 @@ import sys
 import base64
 import json
 import re
+import requests
 from pathlib import Path
 from io import BytesIO
 
@@ -10,9 +11,8 @@ try:
     import cv2
     import numpy as np
     from PIL import Image, ImageEnhance
-    from openai import OpenAI
 except ImportError:
-    print("❌ 缺少依赖，请运行: pip install PyQt6 opencv-python-headless Pillow numpy openai")
+    print("❌ 缺少依赖，请运行: pip install PyQt6 opencv-python-headless Pillow numpy requests")
     sys.exit(1)
 
 from PyQt6.QtWidgets import (
@@ -26,9 +26,10 @@ from PyQt6.QtCore import QThread, pyqtSignal
 # 配置区
 # ────────────────────────────────────────────
 API_KEY  = "sk-46X32UEI0hNcKczjbwivYhrlvJgwQjOwCXQ7jZxut7oscoSo"
-BASE_URL = "https://api.moonshot.cn/v1"
-# MODEL    = "kimi-k2.5"
-MODEL    = "moonshot-v1-8k-vision-preview"
+# API_URL  = "https://api.moonshot.cn/v1/chat/completions"
+API_URL  = "https://api.moonshot.cn/v1"# MODEL    = "moonshot-v1-8k-vision-preview"
+
+MODEL    = "kimi-k2.5"
 
 # 打印规格 (宽×高 px, 300 DPI)
 PRINT_SIZES = {
@@ -57,7 +58,7 @@ def load_config():
                     data["last_start_index"] = 1
                 return data
         except: pass
-    return {"last_prefix": "goods", "last_start_index": 1, "last_watermark": "不处理"}
+    return {"last_prefix": "goods", "last_start_index": 1}
 
 def save_config(data):
     try:
@@ -69,44 +70,11 @@ def save_config(data):
 # 核心处理引擎
 # ────────────────────────────────────────────
 
-def remove_watermark(img_cv: np.ndarray, position: str) -> np.ndarray:
-    """基于 OpenCV 形态学的智能去水印"""
-    if position == "不处理":
-        return img_cv
-
-    h, w = img_cv.shape[:2]
-    roi_w, roi_h = int(w * 0.3), int(h * 0.2)
-
-    if "右下" in position:
-        x1, y1, x2, y2 = w - roi_w, h - roi_h, w, h
-    elif "左下" in position:
-        x1, y1, x2, y2 = 0, h - roi_h, roi_w, h
-    elif "右上" in position:
-        x1, y1, x2, y2 = w - roi_w, 0, w, roi_h
-    elif "左上" in position:
-        x1, y1, x2, y2 = 0, 0, roi_w, roi_h
-    else:
-        return img_cv
-
-    roi = img_cv[y1:y2, x1:x2]
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
-
-    _, mask = cv2.threshold(tophat, 20, 255, cv2.THRESH_BINARY)
-    mask = cv2.dilate(mask, np.ones((3,3), np.uint8), iterations=1)
-
-    inpainted_roi = cv2.inpaint(roi, mask, 5, cv2.INPAINT_TELEA)
-
-    result = img_cv.copy()
-    result[y1:y2, x1:x2] = inpainted_roi
-    return result
-
 def analyze_and_detect_subject(image_path, log_signal):
-    """带美学引导的 AI 主体检测 (使用官方 OpenAI SDK，已修复 temperature 问题)"""
-    log_signal.emit(f"  🤖 正在调用 {MODEL} 进行美学构图分析...")
+    """带美学引导的 AI 主体检测 (内置防 400 & SSL 报错)"""
+    log_signal.emit("  🤖 AI 正在进行美学构图分析...")
     try:
+        # 【修复1：内存压缩】解决 400 Bad Request
         img_for_ai = Image.open(image_path).convert("RGB")
         max_size = 1024
         if max(img_for_ai.size) > max_size:
@@ -114,52 +82,48 @@ def analyze_and_detect_subject(image_path, log_signal):
 
         buf = BytesIO()
         img_for_ai.save(buf, format="JPEG", quality=85)
-        b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+        b64 = base64.b64encode(buf.getvalue()).decode()
 
-        client = OpenAI(
-            api_key=API_KEY,
-            base_url=BASE_URL,
-        )
-
-        # 修复点：移除了 temperature 参数，使用默认值 1 防止报错
-        completion = client.chat.completions.create(
-            model=MODEL,
-            max_tokens=800,
-            messages=[{
+        # 构造请求
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
+        payload = {
+            "model": MODEL,
+            "max_tokens": 800,
+            "temperature": 0.2,
+            "messages": [{
                 "role": "user",
                 "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "你是一个资深动漫排版设计师。分析这张动漫图片用于拼多多高清商品主图。\n"
-                            "请识别画面中‘最具吸引力的视觉焦点’（如果是人物，必须完整框选，且框顶部包含头顶/头发）。\n"
-                            "返回该焦点的归一化坐标 [ymin, xmin, ymax, xmax] (0-1000)。\n"
-                            "仅回复 JSON：{\"style\":\"风格描述\",\"subject_box\":[ymin,xmin,ymax,xmax]}"
-                        )
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
-                    }
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                    {"type": "text", "text": (
+                        "你是一个资深动漫排版设计师。分析这张动漫图片用于拼多多高清商品主图。\n"
+                        "请识别画面中‘最具吸引力的视觉焦点’（如果是人物，必须完整框选，且框顶部包含头顶/头发）。\n"
+                        "返回该焦点的归一化坐标 [ymin, xmin, ymax, xmax] (0-1000)。\n"
+                        "仅回复 JSON：{\"style\":\"风格描述\",\"subject_box\":[ymin,xmin,ymax,xmax]}"
+                    )}
                 ]
             }]
-        )
+        }
 
-        content = completion.choices[0].message.content
+        # 【修复2：屏蔽代理】解决 SSL 握手报错
+        proxies = { "http": None, "https": None }
+        r = requests.post(API_URL, headers=headers, json=payload, timeout=35, proxies=proxies)
+        r.raise_for_status()
+        content = r.json()["choices"][0]["message"]["content"]
+
         m = re.search(r'\{.*\}', content, re.DOTALL)
         if m:
             data = json.loads(m.group())
             if "subject_box" in data and isinstance(data["subject_box"], list) and len(data["subject_box"]) == 4:
                 return data
             else:
-                log_signal.emit("  ⚠️ AI 未能返回有效坐标，将回退标准等比例裁剪。")
+                log_signal.emit("  ⚠️ AI 未能返回有效坐标，将回退居中裁剪。")
         return {}
     except Exception as e:
         log_signal.emit(f"  ⚠️ AI 分析失败: {e}")
         return {}
 
 def smart_ai_crop(img_pil, subject_box, target_size, log_signal):
-    """美学裁剪算法：三分法 + 护头机制"""
+    """美学裁剪算法：三分法 + 护头机制 + 边缘留白"""
     w, h = img_pil.size
     tw, th = target_size
     target_ratio = tw / th
@@ -167,24 +131,27 @@ def smart_ai_crop(img_pil, subject_box, target_size, log_signal):
     ymin, xmin, ymax, xmax = [int(v * (h if i%2==0 else w) / 1000) for i, v in enumerate(subject_box)]
     sbj_h = ymax - ymin
 
+    # 视觉重心（人物面部/胸部位置，通常在主体上部 30% 处）
     visual_cx = (xmin + xmax) // 2
     visual_cy = ymin + int(sbj_h * 0.3)
 
-    if target_ratio > 1:
+    if target_ratio > 1: # 横图
         crop_h = h; crop_w = int(h * target_ratio)
         if crop_w > w:
             crop_w = w; crop_h = int(w / target_ratio)
             crop_l = 0; crop_t = max(0, min(visual_cy - int(crop_h * 0.33), h - crop_h))
         else:
             crop_t = 0; crop_l = max(0, min(visual_cx - (crop_w // 2), w - crop_w))
-    else:
+    else: # 竖图 (黄金三分法应用)
         crop_w = w; crop_h = int(w / target_ratio)
         if crop_h > h:
             crop_h = h; crop_w = int(h * target_ratio)
             crop_t = 0; crop_l = max(0, min(visual_cx - (crop_w // 2), w - crop_w))
         else:
             crop_l = 0
+            # 视觉重心放在裁剪框的上 1/3 处
             ideal_t = visual_cy - int(crop_h * 0.33)
+            # 强制护头：给头顶留出画面高度 5% 的呼吸空间
             safe_top = max(0, ymin - int(crop_h * 0.05))
             crop_t = max(0, min(ideal_t, h - crop_h))
             if crop_t > safe_top: crop_t = safe_top
@@ -192,33 +159,11 @@ def smart_ai_crop(img_pil, subject_box, target_size, log_signal):
     log_signal.emit(f"  📐 已应用美学构图方案，正在裁剪...")
     return img_pil.crop((crop_l, crop_t, crop_l + crop_w, crop_t + crop_h)).resize(target_size, Image.LANCZOS)
 
-def crop_to_target_fixed(img_pil: Image.Image, target_size: tuple) -> Image.Image:
-    """标准等比例无损居中裁剪，绝对防止拉伸变形"""
-    tw, th = target_size
-    w, h = img_pil.size
-    target_ratio = tw / th
-    img_ratio = w / h
-
-    if img_ratio > target_ratio:
-        new_h = h
-        new_w = int(h * target_ratio)
-        l = (w - new_w) // 2
-        t = 0
-    else:
-        new_w = w
-        new_h = int(w / target_ratio)
-        l = 0
-        t = (h - new_h) // 2
-
-    cropped = img_pil.crop((l, t, l + new_w, t + new_h))
-    return cropped.resize(target_size, Image.LANCZOS)
-
 def anime_sharpen(img_cv: np.ndarray) -> np.ndarray:
-    """动漫专用锐化（已降低锐化强度，防打印噪点）"""
+    """动漫专用锐化"""
     f = img_cv.astype(np.float32)
     blur = cv2.GaussianBlur(f, (0,0), sigmaX=1.5)
-    # 降低了权重，让锐化更柔和
-    usm  = cv2.addWeighted(f, 1.3, blur, -0.3, 0)
+    usm  = cv2.addWeighted(f, 1.75, blur, -0.75, 0)
     gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
     lap  = cv2.Laplacian(gray, cv2.CV_64F, ksize=3)
     mask = (np.abs(lap) / (np.abs(lap).max() + 1e-6) * 0.25).astype(np.float32)
@@ -228,12 +173,11 @@ def anime_sharpen(img_cv: np.ndarray) -> np.ndarray:
     return np.clip(usm*(1-mask3) + xsharp*mask3, 0, 255).astype(np.uint8)
 
 def enhance_colors(img_pil: Image.Image) -> Image.Image:
-    """打印色彩补偿（柔和版清晰度）"""
+    """打印色彩补偿"""
     img_pil = ImageEnhance.Contrast(img_pil).enhance(1.15)
     img_pil = ImageEnhance.Color(img_pil).enhance(1.20)
     img_pil = ImageEnhance.Brightness(img_pil).enhance(1.05)
-    # 清晰度从 1.5 降到了 1.2
-    return ImageEnhance.Sharpness(img_pil).enhance(1.2)
+    return ImageEnhance.Sharpness(img_pil).enhance(1.5)
 
 # ────────────────────────────────────────────
 # 工作线程
@@ -242,12 +186,11 @@ class ProcessWorker(QThread):
     log_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(int, int)
 
-    def __init__(self, in_dir, out_dir, prefix, start_idx, scale, size_key, skip_ai, watermark_pos):
+    def __init__(self, in_dir, out_dir, prefix, start_idx, scale, size_key, skip_ai):
         super().__init__()
         self.in_dir, self.out_dir = in_dir, out_dir
         self.prefix, self.start_idx = prefix, start_idx
-        self.scale, self.size_key = scale, size_key
-        self.skip_ai, self.watermark_pos = skip_ai, watermark_pos
+        self.scale, self.size_key, self.skip_ai = scale, size_key, skip_ai
 
     def run(self):
         exts = {".jpg", ".jpeg", ".png", ".webp"}
@@ -268,21 +211,13 @@ class ProcessWorker(QThread):
             self.log_signal.emit(f"[{i}/{len(files)}] 处理: {name}")
             try:
                 img = Image.open(path).convert("RGB")
-
-                # --- 1. 智能去水印 ---
-                if self.watermark_pos != "不处理":
-                    self.log_signal.emit(f"  💧 正在智能抹除 {self.watermark_pos} 的水印...")
-                    cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-                    cv_img_clean = remove_watermark(cv_img, self.watermark_pos)
-                    img = Image.fromarray(cv2.cvtColor(cv_img_clean, cv2.COLOR_BGR2RGB))
-
                 ow, oh = img.size
 
-                # --- 2. 超分放大 ---
+                # 1. 超分放大
                 self.log_signal.emit(f"  🔍 超分放大 ×{self.scale}...")
                 img_up = img.resize((ow * self.scale, oh * self.scale), Image.LANCZOS)
 
-                # --- 3. 裁剪 ---
+                # 2. 裁剪
                 target_img = img_up
                 if self.size_key != "不裁剪 (保持原比例)":
                     target_size = PRINT_SIZES[self.size_key]
@@ -291,20 +226,26 @@ class ProcessWorker(QThread):
                         if "subject_box" in ai_data:
                             target_img = smart_ai_crop(img_up, ai_data["subject_box"], target_size, self.log_signal)
                         else:
-                            self.log_signal.emit(f"  📐 执行标准等比例无损裁剪...")
-                            target_img = crop_to_target_fixed(img_up, target_size)
+                            self.log_signal.emit(f"  📐 执行标准居中裁剪...")
+                            target_img = img_up.crop((0,0,img_up.width,img_up.height)).resize(target_size, Image.LANCZOS)
                     else:
-                        self.log_signal.emit(f"  📐 执行标准等比例无损裁剪...")
-                        target_img = crop_to_target_fixed(img_up, target_size)
+                        self.log_signal.emit(f"  📐 执行标准缩放裁剪...")
+                        # 简易居中裁剪
+                        tw, th = target_size; w, h = img_up.size; ratio = w/h
+                        if ratio > tw/th: nh = th; nw = int(nh*ratio)
+                        else: nw = tw; nh = int(nw/ratio)
+                        img_tmp = img_up.resize((nw,nh), Image.LANCZOS)
+                        l = (nw-tw)//2; t = (nh-th)//2
+                        target_img = img_tmp.crop((l,t,l+tw,t+th))
 
-                # --- 4. 增强画质 ---
-                self.log_signal.emit("  ✨ 柔和锐化与打印色彩补偿...")
+                # 3. 增强画质
+                self.log_signal.emit("  ✨ 锐化与打印色彩补偿...")
                 cv_img = cv2.cvtColor(np.array(target_img), cv2.COLOR_RGB2BGR)
                 cv_sharp = anime_sharpen(cv_img)
                 img_final = Image.fromarray(cv2.cvtColor(cv_sharp, cv2.COLOR_BGR2RGB))
                 img_final = enhance_colors(img_final)
 
-                # --- 5. 保存重命名 ---
+                # 4. 保存重命名
                 while True:
                     save_name = f"{self.prefix}_{counter:04d}.png"
                     target_path = os.path.join(self.out_dir, save_name)
@@ -328,8 +269,8 @@ class ProcessWorker(QThread):
 class AnimeApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("动漫图片超分修复 & 去水印 & 批量重命名工具")
-        self.resize(850, 720)
+        self.setWindowTitle("动漫图片智能美学裁剪 & 批量重命名工具")
+        self.resize(850, 700)
         self.setStyleSheet("""
             QWidget { background: #1E1F23; color: #F0F0F2; font-family: 'Microsoft YaHei UI'; font-size: 13px; }
             QLineEdit, QTextEdit, QSpinBox, QComboBox { background: #26272C; border: 1px solid #3A3B42; border-radius: 6px; padding: 7px; }
@@ -354,6 +295,7 @@ class AnimeApp(QMainWindow):
         layout.setContentsMargins(25, 25, 25, 25)
         layout.setSpacing(15)
 
+        # 1. 路径选择
         p_in_lay = QHBoxLayout()
         self.edit_in = QLineEdit(); self.edit_in.setPlaceholderText("选择待处理照片的源文件夹...")
         self.edit_in.setReadOnly(True)
@@ -368,25 +310,19 @@ class AnimeApp(QMainWindow):
         p_out_lay.addWidget(self.edit_out, stretch=1); p_out_lay.addWidget(btn_out)
         layout.addLayout(p_out_lay)
 
+        # 2. 参数控制
         param_lay = QHBoxLayout()
 
+        # 左侧：图像处理
         v_left = QVBoxLayout()
-
-        v_left.addWidget(QLabel("💧 去除水印:"))
-        self.cb_watermark = QComboBox()
-        self.cb_watermark.addItems(["不处理", "右下角", "左下角", "右上角", "左上角"])
-        self.cb_watermark.setCurrentText(self.config.get("last_watermark", "不处理"))
-        v_left.addWidget(self.cb_watermark)
-
-        v_left.addSpacing(10)
-        v_left.addWidget(QLabel("🔍 放大倍数:"))
+        v_left.addWidget(QLabel("放大倍数:"))
         self.cb_scale = QComboBox()
         self.cb_scale.addItems(["2", "3", "4", "6", "8"])
         self.cb_scale.setCurrentText("4")
         v_left.addWidget(self.cb_scale)
 
         v_left.addSpacing(10)
-        v_left.addWidget(QLabel("📏 打印规格:"))
+        v_left.addWidget(QLabel("打印规格:"))
         self.cb_size = QComboBox()
         self.cb_size.addItems(list(PRINT_SIZES.keys()))
         self.cb_size.setCurrentText("AI智能美学裁剪(垂直5:7)")
@@ -399,6 +335,7 @@ class AnimeApp(QMainWindow):
         param_lay.addLayout(v_left, stretch=1)
         param_lay.addSpacing(20)
 
+        # 右侧：重命名
         v_right = QVBoxLayout()
         v_right.addWidget(QLabel("命名前缀:"))
         self.edit_pre = QLineEdit(self.config["last_prefix"])
@@ -417,9 +354,11 @@ class AnimeApp(QMainWindow):
 
         layout.addLayout(param_lay)
 
+        # 3. 日志窗
         self.log = QTextEdit(); layout.addWidget(self.log, stretch=1)
 
-        self.btn_run = QPushButton("🚀 开始全自动处理 (去水印+超分+裁剪+重命名)")
+        # 4. 按钮
+        self.btn_run = QPushButton("🚀 开始批量智能处理 && 重命名")
         self.btn_run.setObjectName("btn_primary"); self.btn_run.setFixedHeight(45)
         self.btn_run.clicked.connect(self._run)
         layout.addWidget(self.btn_run)
@@ -434,13 +373,13 @@ class AnimeApp(QMainWindow):
 
         out_d = self.edit_out.text().strip() or os.path.join(in_d, "enhanced_output")
 
+        # 保存配置
         self.config["last_prefix"] = self.edit_pre.text().strip()
         self.config["last_start_index"] = self.sp_idx.value()
-        self.config["last_watermark"] = self.cb_watermark.currentText()
         save_config(self.config)
 
         self.btn_run.setEnabled(False)
-        self.btn_run.setText("⏳ 拼命处理中...")
+        self.btn_run.setText("⏳ 处理中...")
         self.log.clear()
 
         self.worker = ProcessWorker(
@@ -450,8 +389,7 @@ class AnimeApp(QMainWindow):
             start_idx=self.config["last_start_index"],
             scale=int(self.cb_scale.currentText()),
             size_key=self.cb_size.currentText(),
-            skip_ai=self.chk_skip.isChecked(),
-            watermark_pos=self.cb_watermark.currentText()
+            skip_ai=self.chk_skip.isChecked()
         )
         self.worker.log_signal.connect(self.log.append)
         self.worker.finished_signal.connect(self._done)
@@ -459,7 +397,7 @@ class AnimeApp(QMainWindow):
 
     def _done(self, ok, total):
         self.btn_run.setEnabled(True)
-        self.btn_run.setText("🚀 开始全自动处理 (去水印+超分+裁剪+重命名)")
+        self.btn_run.setText("🚀 开始批量智能处理 && 重命名")
 
         self.log.append(f"\n{'='*40}")
         self.log.append(f"🎉 处理完成！成功生成 {ok}/{total} 张高清主图。")

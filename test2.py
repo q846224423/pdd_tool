@@ -1,472 +1,156 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
-import sys
-import base64
-import json
-import re
-from pathlib import Path
-from io import BytesIO
+import math
+from PIL import Image, ImageDraw, ImageFont
 
-try:
-    import cv2
-    import numpy as np
-    from PIL import Image, ImageEnhance
-    from openai import OpenAI
-except ImportError:
-    print("❌ 缺少依赖，请运行: pip install PyQt6 opencv-python-headless Pillow numpy openai")
-    sys.exit(1)
+# ================= 配置区域 =================
+# 字体路径：必须是支持中文的字体文件！
+# Windows 默认可用: "C:/Windows/Fonts/msyh.ttc" (微软雅黑) 或 "simhei.ttf" (黑体)
+# Mac 默认可用: "/System/Library/Fonts/PingFang.ttc" (苹方)
+FONT_PATH = "C:/Windows/Fonts/msyh.ttc"  # 请根据你的系统修改这里！
 
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLineEdit, QPushButton, QTextEdit, QFileDialog, QMessageBox, QLabel,
-    QSpinBox, QComboBox, QCheckBox
-)
-from PyQt6.QtCore import QThread, pyqtSignal
+# 公章配置
+SEAL_TEXT_TOP = "宝岛旅游股份有限公司"  # 你的自定义文字
+SEAL_TEXT_BOTTOM = "版权所有"           # 底部辅助文字
+SEAL_SIZE = 400                         # 公章生成的分辨率大小
+SEAL_COLOR = (220, 20, 60, 255)         # 公章基础颜色 (RGB)，默认暗红色
+# ============================================
 
-# ────────────────────────────────────────────
-# 配置区
-# ────────────────────────────────────────────
-API_KEY  = "sk-46X32UEI0hNcKczjbwivYhrlvJgwQjOwCXQ7jZxut7oscoSo"
-BASE_URL = "https://api.moonshot.cn/v1"
-# MODEL    = "kimi-k2.5"
-MODEL    = "moonshot-v1-8k-vision-preview"
+def draw_curved_text(base_img, text, font, radius, color, start_angle, end_angle):
+    """辅助函数：沿着圆弧绘制文字"""
+    cx, cy = base_img.size[0] / 2, base_img.size[1] / 2
+    chars = list(text)
+    if not chars:
+        return
 
-# 打印规格 (宽×高 px, 300 DPI)
-PRINT_SIZES = {
-    "不裁剪 (保持原比例)": None,
-    "AI智能美学裁剪(垂直5:7)": (1500, 2100),
-    "AI智能美学裁剪(水平7:5)": (2100, 1500),
-    "明信片(4×6寸)":         (1800, 1200),
-    "5寸(5×3.5寸)":           (1500, 1050),
-    "6寸(6×4寸)":             (1800, 1200),
-    "7寸(7×5寸)":             (2100, 1500),
-    "8寸(8×6寸)":             (2400, 1800),
-    "10寸(10×8寸)":           (3000, 2400),
-    "A4(21×29.7cm)":         (2480, 3508),
-    "A3(29.7×42cm)":         (3508, 4961),
-    "正方形海报(20×20cm)":   (2362, 2362),
-}
+    # 计算每个字的间隔角度
+    angle_step = (end_angle - start_angle) / (len(chars) - 1) if len(chars) > 1 else 0
 
-CONFIG_FILE = "anime_pro_config.json"
+    for i, char in enumerate(chars):
+        # 1. 创建单个字符的透明画布
+        char_img = Image.new('RGBA', (font.size * 2, font.size * 2), (255, 255, 255, 0))
+        char_draw = ImageDraw.Draw(char_img)
+        char_draw.text((font.size, font.size), char, font=font, fill=color, anchor="mm")
 
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if "last_start_index" not in data:
-                    data["last_start_index"] = 1
-                return data
-        except: pass
-    return {"last_prefix": "goods", "last_start_index": 1, "last_watermark": "不处理"}
+        # 2. 计算当前字符所在的绝对角度 (极坐标)
+        angle = start_angle + i * angle_step
 
-def save_config(data):
+        # 3. 旋转单字图片使其指向圆心 (Pillow旋转是逆时针)
+        rot_angle = -math.degrees(angle) - 90
+        rotated_char = char_img.rotate(rot_angle, resample=Image.Resampling.BICUBIC, expand=True)
+
+        # 4. 计算贴图的直角坐标
+        x = cx + radius * math.cos(angle)
+        y = cy + radius * math.sin(angle)
+
+        # 5. 居中贴回原图
+        px = int(x - rotated_char.size[0] / 2)
+        py = int(y - rotated_char.size[1] / 2)
+        base_img.paste(rotated_char, (px, py), rotated_char)
+
+def create_transparent_seal():
+    """生成带有环形文字的透明公章图片"""
+    # 1. 创建透明正方形画布
+    img = Image.new("RGBA", (SEAL_SIZE, SEAL_SIZE), (255, 255, 255, 0))
+    draw = ImageDraw.Draw(img)
+
+    # 2. 画外圈粗线
+    line_width = int(SEAL_SIZE * 0.03)
+    pad = line_width
+    draw.ellipse((pad, pad, SEAL_SIZE - pad, SEAL_SIZE - pad), outline=SEAL_COLOR, width=line_width)
+
+    # 3. 画内圈细线
+    pad2 = line_width * 3
+    draw.ellipse((pad2, pad2, SEAL_SIZE - pad2, SEAL_SIZE - pad2), outline=SEAL_COLOR, width=int(line_width*0.3))
+
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
-    except: pass
-
-# ────────────────────────────────────────────
-# 核心处理引擎
-# ────────────────────────────────────────────
-
-def remove_watermark(img_cv: np.ndarray, position: str) -> np.ndarray:
-    """基于 OpenCV 形态学的智能去水印"""
-    if position == "不处理":
-        return img_cv
-
-    h, w = img_cv.shape[:2]
-    roi_w, roi_h = int(w * 0.3), int(h * 0.2)
-
-    if "右下" in position:
-        x1, y1, x2, y2 = w - roi_w, h - roi_h, w, h
-    elif "左下" in position:
-        x1, y1, x2, y2 = 0, h - roi_h, roi_w, h
-    elif "右上" in position:
-        x1, y1, x2, y2 = w - roi_w, 0, w, roi_h
-    elif "左上" in position:
-        x1, y1, x2, y2 = 0, 0, roi_w, roi_h
-    else:
-        return img_cv
-
-    roi = img_cv[y1:y2, x1:x2]
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
-
-    _, mask = cv2.threshold(tophat, 20, 255, cv2.THRESH_BINARY)
-    mask = cv2.dilate(mask, np.ones((3,3), np.uint8), iterations=1)
-
-    inpainted_roi = cv2.inpaint(roi, mask, 5, cv2.INPAINT_TELEA)
-
-    result = img_cv.copy()
-    result[y1:y2, x1:x2] = inpainted_roi
-    return result
-
-def analyze_and_detect_subject(image_path, log_signal):
-    """带美学引导的 AI 主体检测 (使用官方 OpenAI SDK，已修复 temperature 问题)"""
-    log_signal.emit(f"  🤖 正在调用 {MODEL} 进行美学构图分析...")
-    try:
-        img_for_ai = Image.open(image_path).convert("RGB")
-        max_size = 1024
-        if max(img_for_ai.size) > max_size:
-            img_for_ai.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-
-        buf = BytesIO()
-        img_for_ai.save(buf, format="JPEG", quality=85)
-        b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-
-        client = OpenAI(
-            api_key=API_KEY,
-            base_url=BASE_URL,
-        )
-
-        # 修复点：移除了 temperature 参数，使用默认值 1 防止报错
-        completion = client.chat.completions.create(
-            model=MODEL,
-            max_tokens=800,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "你是一个资深动漫排版设计师。分析这张动漫图片用于拼多多高清商品主图。\n"
-                            "请识别画面中‘最具吸引力的视觉焦点’（如果是人物，必须完整框选，且框顶部包含头顶/头发）。\n"
-                            "返回该焦点的归一化坐标 [ymin, xmin, ymax, xmax] (0-1000)。\n"
-                            "仅回复 JSON：{\"style\":\"风格描述\",\"subject_box\":[ymin,xmin,ymax,xmax]}"
-                        )
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
-                    }
-                ]
-            }]
-        )
-
-        content = completion.choices[0].message.content
-        m = re.search(r'\{.*\}', content, re.DOTALL)
-        if m:
-            data = json.loads(m.group())
-            if "subject_box" in data and isinstance(data["subject_box"], list) and len(data["subject_box"]) == 4:
-                return data
-            else:
-                log_signal.emit("  ⚠️ AI 未能返回有效坐标，将回退标准等比例裁剪。")
-        return {}
-    except Exception as e:
-        log_signal.emit(f"  ⚠️ AI 分析失败: {e}")
-        return {}
-
-def smart_ai_crop(img_pil, subject_box, target_size, log_signal):
-    """美学裁剪算法：三分法 + 护头机制"""
-    w, h = img_pil.size
-    tw, th = target_size
-    target_ratio = tw / th
-
-    ymin, xmin, ymax, xmax = [int(v * (h if i%2==0 else w) / 1000) for i, v in enumerate(subject_box)]
-    sbj_h = ymax - ymin
-
-    visual_cx = (xmin + xmax) // 2
-    visual_cy = ymin + int(sbj_h * 0.3)
-
-    if target_ratio > 1:
-        crop_h = h; crop_w = int(h * target_ratio)
-        if crop_w > w:
-            crop_w = w; crop_h = int(w / target_ratio)
-            crop_l = 0; crop_t = max(0, min(visual_cy - int(crop_h * 0.33), h - crop_h))
-        else:
-            crop_t = 0; crop_l = max(0, min(visual_cx - (crop_w // 2), w - crop_w))
-    else:
-        crop_w = w; crop_h = int(w / target_ratio)
-        if crop_h > h:
-            crop_h = h; crop_w = int(h * target_ratio)
-            crop_t = 0; crop_l = max(0, min(visual_cx - (crop_w // 2), w - crop_w))
-        else:
-            crop_l = 0
-            ideal_t = visual_cy - int(crop_h * 0.33)
-            safe_top = max(0, ymin - int(crop_h * 0.05))
-            crop_t = max(0, min(ideal_t, h - crop_h))
-            if crop_t > safe_top: crop_t = safe_top
-
-    log_signal.emit(f"  📐 已应用美学构图方案，正在裁剪...")
-    return img_pil.crop((crop_l, crop_t, crop_l + crop_w, crop_t + crop_h)).resize(target_size, Image.LANCZOS)
-
-def crop_to_target_fixed(img_pil: Image.Image, target_size: tuple) -> Image.Image:
-    """标准等比例无损居中裁剪，绝对防止拉伸变形"""
-    tw, th = target_size
-    w, h = img_pil.size
-    target_ratio = tw / th
-    img_ratio = w / h
-
-    if img_ratio > target_ratio:
-        new_h = h
-        new_w = int(h * target_ratio)
-        l = (w - new_w) // 2
-        t = 0
-    else:
-        new_w = w
-        new_h = int(w / target_ratio)
-        l = 0
-        t = (h - new_h) // 2
-
-    cropped = img_pil.crop((l, t, l + new_w, t + new_h))
-    return cropped.resize(target_size, Image.LANCZOS)
-
-def anime_sharpen(img_cv: np.ndarray) -> np.ndarray:
-    """动漫专用锐化（已降低锐化强度，防打印噪点）"""
-    f = img_cv.astype(np.float32)
-    blur = cv2.GaussianBlur(f, (0,0), sigmaX=1.5)
-    # 降低了权重，让锐化更柔和
-    usm  = cv2.addWeighted(f, 1.3, blur, -0.3, 0)
-    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-    lap  = cv2.Laplacian(gray, cv2.CV_64F, ksize=3)
-    mask = (np.abs(lap) / (np.abs(lap).max() + 1e-6) * 0.25).astype(np.float32)
-    mask3 = np.stack([mask]*3, axis=2)
-    kernel = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]], dtype=np.float32)
-    xsharp = cv2.filter2D(f, -1, kernel)
-    return np.clip(usm*(1-mask3) + xsharp*mask3, 0, 255).astype(np.uint8)
-
-def enhance_colors(img_pil: Image.Image) -> Image.Image:
-    """打印色彩补偿（柔和版清晰度）"""
-    img_pil = ImageEnhance.Contrast(img_pil).enhance(1.15)
-    img_pil = ImageEnhance.Color(img_pil).enhance(1.20)
-    img_pil = ImageEnhance.Brightness(img_pil).enhance(1.05)
-    # 清晰度从 1.5 降到了 1.2
-    return ImageEnhance.Sharpness(img_pil).enhance(1.2)
-
-# ────────────────────────────────────────────
-# 工作线程
-# ────────────────────────────────────────────
-class ProcessWorker(QThread):
-    log_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal(int, int)
-
-    def __init__(self, in_dir, out_dir, prefix, start_idx, scale, size_key, skip_ai, watermark_pos):
-        super().__init__()
-        self.in_dir, self.out_dir = in_dir, out_dir
-        self.prefix, self.start_idx = prefix, start_idx
-        self.scale, self.size_key = scale, size_key
-        self.skip_ai, self.watermark_pos = skip_ai, watermark_pos
-
-    def run(self):
-        exts = {".jpg", ".jpeg", ".png", ".webp"}
-        files = [f for f in os.listdir(self.in_dir) if Path(f).suffix.lower() in exts]
-
-        if not files:
-            self.log_signal.emit(f"❌ {self.in_dir} 中未找到支持的图片格式。")
-            self.finished_signal.emit(0, 0)
-            return
-
-        os.makedirs(self.out_dir, exist_ok=True)
-        ok = 0
-        counter = self.start_idx
-
-        for i, name in enumerate(files, 1):
-            path = os.path.join(self.in_dir, name)
-            self.log_signal.emit(f"\n{'━'*40}")
-            self.log_signal.emit(f"[{i}/{len(files)}] 处理: {name}")
-            try:
-                img = Image.open(path).convert("RGB")
-
-                # --- 1. 智能去水印 ---
-                if self.watermark_pos != "不处理":
-                    self.log_signal.emit(f"  💧 正在智能抹除 {self.watermark_pos} 的水印...")
-                    cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-                    cv_img_clean = remove_watermark(cv_img, self.watermark_pos)
-                    img = Image.fromarray(cv2.cvtColor(cv_img_clean, cv2.COLOR_BGR2RGB))
-
-                ow, oh = img.size
-
-                # --- 2. 超分放大 ---
-                self.log_signal.emit(f"  🔍 超分放大 ×{self.scale}...")
-                img_up = img.resize((ow * self.scale, oh * self.scale), Image.LANCZOS)
-
-                # --- 3. 裁剪 ---
-                target_img = img_up
-                if self.size_key != "不裁剪 (保持原比例)":
-                    target_size = PRINT_SIZES[self.size_key]
-                    if not self.skip_ai and "AI智能" in self.size_key:
-                        ai_data = analyze_and_detect_subject(path, self.log_signal)
-                        if "subject_box" in ai_data:
-                            target_img = smart_ai_crop(img_up, ai_data["subject_box"], target_size, self.log_signal)
-                        else:
-                            self.log_signal.emit(f"  📐 执行标准等比例无损裁剪...")
-                            target_img = crop_to_target_fixed(img_up, target_size)
-                    else:
-                        self.log_signal.emit(f"  📐 执行标准等比例无损裁剪...")
-                        target_img = crop_to_target_fixed(img_up, target_size)
-
-                # --- 4. 增强画质 ---
-                self.log_signal.emit("  ✨ 柔和锐化与打印色彩补偿...")
-                cv_img = cv2.cvtColor(np.array(target_img), cv2.COLOR_RGB2BGR)
-                cv_sharp = anime_sharpen(cv_img)
-                img_final = Image.fromarray(cv2.cvtColor(cv_sharp, cv2.COLOR_BGR2RGB))
-                img_final = enhance_colors(img_final)
-
-                # --- 5. 保存重命名 ---
-                while True:
-                    save_name = f"{self.prefix}_{counter:04d}.png"
-                    target_path = os.path.join(self.out_dir, save_name)
-                    if not os.path.exists(target_path): break
-                    counter += 1
-
-                img_final.save(target_path, "PNG", dpi=(300,300))
-                mb = os.path.getsize(target_path) / 1024 / 1024
-                self.log_signal.emit(f"  ✅ 成功保存: {save_name} ({mb:.1f} MB)")
-
-                ok += 1
-                counter += 1
-            except Exception as e:
-                self.log_signal.emit(f"  ❌ 失败: {e}")
-
-        self.finished_signal.emit(ok, len(files))
-
-# ────────────────────────────────────────────
-# 界面类
-# ────────────────────────────────────────────
-class AnimeApp(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("动漫图片超分修复 & 去水印 & 批量重命名工具")
-        self.resize(850, 720)
-        self.setStyleSheet("""
-            QWidget { background: #1E1F23; color: #F0F0F2; font-family: 'Microsoft YaHei UI'; font-size: 13px; }
-            QLineEdit, QTextEdit, QSpinBox, QComboBox { background: #26272C; border: 1px solid #3A3B42; border-radius: 6px; padding: 7px; }
-            QPushButton { background: #3A3B42; border-radius: 6px; padding: 8px 15px; font-weight: bold; }
-            QPushButton:hover { background: #4A4B52; }
-            QPushButton#btn_primary { background: #07C160; color: white; border: none; font-size: 14px;}
-            QPushButton#btn_primary:hover { background: #06AD56; }
-            QPushButton#btn_primary:disabled { background: #0A3020; color: #2A6040; }
-            QTextEdit { background: #16171A; font-family: 'Consolas'; color: #A8C7FA; }
-            QCheckBox { spacing: 8px; }
-            QCheckBox::indicator { width: 16px; height: 16px; border-radius: 4px; border: 1px solid #3A3B42; background: #26272C;}
-            QCheckBox::indicator:checked { background: #07C160; border: 1px solid #07C160;}
-        """)
-
-        self.config = load_config()
-        self.init_ui()
-
-    def init_ui(self):
-        root = QWidget()
-        self.setCentralWidget(root)
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(25, 25, 25, 25)
-        layout.setSpacing(15)
-
-        p_in_lay = QHBoxLayout()
-        self.edit_in = QLineEdit(); self.edit_in.setPlaceholderText("选择待处理照片的源文件夹...")
-        self.edit_in.setReadOnly(True)
-        btn_in = QPushButton("📁 浏览源目录"); btn_in.clicked.connect(lambda: self._sel_dir(self.edit_in))
-        p_in_lay.addWidget(self.edit_in, stretch=1); p_in_lay.addWidget(btn_in)
-        layout.addLayout(p_in_lay)
-
-        p_out_lay = QHBoxLayout()
-        self.edit_out = QLineEdit(); self.edit_out.setPlaceholderText("保存目录 (为空则默认在源目录下新建 enhanced_output)...")
-        self.edit_out.setReadOnly(True)
-        btn_out = QPushButton("📁 选择保存目录"); btn_out.clicked.connect(lambda: self._sel_dir(self.edit_out))
-        p_out_lay.addWidget(self.edit_out, stretch=1); p_out_lay.addWidget(btn_out)
-        layout.addLayout(p_out_lay)
-
-        param_lay = QHBoxLayout()
-
-        v_left = QVBoxLayout()
-
-        v_left.addWidget(QLabel("💧 去除水印:"))
-        self.cb_watermark = QComboBox()
-        self.cb_watermark.addItems(["不处理", "右下角", "左下角", "右上角", "左上角"])
-        self.cb_watermark.setCurrentText(self.config.get("last_watermark", "不处理"))
-        v_left.addWidget(self.cb_watermark)
-
-        v_left.addSpacing(10)
-        v_left.addWidget(QLabel("🔍 放大倍数:"))
-        self.cb_scale = QComboBox()
-        self.cb_scale.addItems(["2", "3", "4", "6", "8"])
-        self.cb_scale.setCurrentText("4")
-        v_left.addWidget(self.cb_scale)
-
-        v_left.addSpacing(10)
-        v_left.addWidget(QLabel("📏 打印规格:"))
-        self.cb_size = QComboBox()
-        self.cb_size.addItems(list(PRINT_SIZES.keys()))
-        self.cb_size.setCurrentText("AI智能美学裁剪(垂直5:7)")
-        v_left.addWidget(self.cb_size)
-
-        v_left.addSpacing(10)
-        self.chk_skip = QCheckBox("跳过 AI 分析 (不使用智能构图)")
-        v_left.addWidget(self.chk_skip)
-
-        param_lay.addLayout(v_left, stretch=1)
-        param_lay.addSpacing(20)
-
-        v_right = QVBoxLayout()
-        v_right.addWidget(QLabel("命名前缀:"))
-        self.edit_pre = QLineEdit(self.config["last_prefix"])
-        self.edit_pre.setPlaceholderText("如: goods")
-        v_right.addWidget(self.edit_pre)
-
-        v_right.addSpacing(10)
-        v_right.addWidget(QLabel("起始序号:"))
-        self.sp_idx = QSpinBox()
-        self.sp_idx.setRange(1, 9999)
-        self.sp_idx.setValue(self.config["last_start_index"])
-        v_right.addWidget(self.sp_idx)
-
-        v_right.addStretch()
-        param_lay.addLayout(v_right, stretch=1)
-
-        layout.addLayout(param_lay)
-
-        self.log = QTextEdit(); layout.addWidget(self.log, stretch=1)
-
-        self.btn_run = QPushButton("🚀 开始全自动处理 (去水印+超分+裁剪+重命名)")
-        self.btn_run.setObjectName("btn_primary"); self.btn_run.setFixedHeight(45)
-        self.btn_run.clicked.connect(self._run)
-        layout.addWidget(self.btn_run)
-
-    def _sel_dir(self, edit):
-        d = QFileDialog.getExistingDirectory(self, "选择文件夹")
-        if d: edit.setText(d)
-
-    def _run(self):
-        in_d = self.edit_in.text().strip()
-        if not in_d: return QMessageBox.warning(self, "错误", "请先选择源照片文件夹！")
-
-        out_d = self.edit_out.text().strip() or os.path.join(in_d, "enhanced_output")
-
-        self.config["last_prefix"] = self.edit_pre.text().strip()
-        self.config["last_start_index"] = self.sp_idx.value()
-        self.config["last_watermark"] = self.cb_watermark.currentText()
-        save_config(self.config)
-
-        self.btn_run.setEnabled(False)
-        self.btn_run.setText("⏳ 拼命处理中...")
-        self.log.clear()
-
-        self.worker = ProcessWorker(
-            in_dir=in_d,
-            out_dir=out_d,
-            prefix=self.config["last_prefix"],
-            start_idx=self.config["last_start_index"],
-            scale=int(self.cb_scale.currentText()),
-            size_key=self.cb_size.currentText(),
-            skip_ai=self.chk_skip.isChecked(),
-            watermark_pos=self.cb_watermark.currentText()
-        )
-        self.worker.log_signal.connect(self.log.append)
-        self.worker.finished_signal.connect(self._done)
-        self.worker.start()
-
-    def _done(self, ok, total):
-        self.btn_run.setEnabled(True)
-        self.btn_run.setText("🚀 开始全自动处理 (去水印+超分+裁剪+重命名)")
-
-        self.log.append(f"\n{'='*40}")
-        self.log.append(f"🎉 处理完成！成功生成 {ok}/{total} 张高清主图。")
-        QMessageBox.information(self, "完成", f"批量处理完成！\n成功: {ok}/{total}\n文件保存在:\n{self.worker.out_dir}")
+        font_top = ImageFont.truetype(FONT_PATH, int(SEAL_SIZE * 0.12))
+        font_bottom = ImageFont.truetype(FONT_PATH, int(SEAL_SIZE * 0.08))
+    except IOError:
+        print(f"❌ 错误: 找不到字体文件 {FONT_PATH}。请检查路径是否正确！")
+        return None
+
+    # 4. 画中心五角星
+    cx, cy = SEAL_SIZE / 2, SEAL_SIZE / 2
+    r_star = SEAL_SIZE * 0.15
+    points = []
+    for i in range(5):
+        # 五角星的角度计算
+        angle = i * 4 * math.pi / 5 - math.pi / 2
+        points.append((cx + r_star * math.cos(angle), cy + r_star * math.sin(angle)))
+    draw.polygon(points, fill=SEAL_COLOR)
+
+    # 5. 绘制环形文字 (顶部)
+    # 起始和结束角度 (这里使用弧度，pi 相当于 180度)
+    # -math.pi 是左边，0 是右边。我们让文字从左上到右上排布
+    start_angle = -math.pi * 0.85
+    end_angle = -math.pi * 0.15
+    text_radius = SEAL_SIZE * 0.36
+    draw_curved_text(img, SEAL_TEXT_TOP, font_top, text_radius, SEAL_COLOR, start_angle, end_angle)
+
+    # 6. 绘制底部文字 (水平)
+    draw.text((cx, cy + SEAL_SIZE * 0.25), SEAL_TEXT_BOTTOM, font=font_bottom, fill=SEAL_COLOR, anchor="mm")
+
+    return img
+
+def apply_seal_watermark(bg_image_path, output_path, opacity_percent=35, scale_percent=25):
+    """将公章作为半透明水印打在图片上"""
+    if not os.path.exists(bg_image_path):
+        print(f"❌ 找不到原图: {bg_image_path}")
+        return
+
+    # 1. 生成公章
+    seal = create_transparent_seal()
+    if seal is None: return
+
+    # 2. 打开原图
+    bg = Image.open(bg_image_path).convert("RGBA")
+    bg_w, bg_h = bg.size
+
+    # 3. 调整公章大小 (根据原图的短边按比例缩放)
+    target_seal_size = int(min(bg_w, bg_h) * (scale_percent / 100.0))
+    seal = seal.resize((target_seal_size, target_seal_size), Image.Resampling.LANCZOS)
+
+    # 4. 调整公章透明度 (防盗关键)
+    # 分离出 alpha 通道，按照百分比降低透明度
+    r, g, b, a = seal.split()
+    a = a.point(lambda p: int(p * (opacity_percent / 100.0)))
+    seal = Image.merge("RGBA", (r, g, b, a))
+
+    # 5. 计算贴图位置 (默认放在右下角，留点边距)
+    padding = int(min(bg_w, bg_h) * 0.05)
+    x = bg_w - target_seal_size - padding
+    y = bg_h - target_seal_size - padding
+
+    # 6. 将公章贴合上去
+    result = Image.alpha_composite(bg, Image.new("RGBA", bg.size, (0,0,0,0)))
+    result.paste(seal, (x, y), seal)
+
+    # 7. 保存结果 (去除 RGBA 的 A 通道保存为 JPG，或者直接存 PNG)
+    result = result.convert("RGB")
+    result.save(output_path, quality=95)
+    print(f"✅ 水印添加成功！已保存至: {output_path}")
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    win = AnimeApp()
-    win.show()
-    sys.exit(app.exec())
+    # --- 测试运行 ---
+
+    # 1. 如果你想先看看公章长什么样，可以单独保存公章：
+    my_seal = create_transparent_seal()
+    if my_seal:
+        my_seal.save("my_seal_preview.png")
+        print("✅ 公章预览已保存为 my_seal_preview.png")
+
+    # 2. 把公章打在你的图片上 (请将 input.jpg 替换为你实际的图片路径)
+    # 参数说明：
+    # opacity_percent: 35 表示 35% 的不透明度，非常适合防盗
+    # scale_percent: 25 表示公章大小占据图片短边的 25%
+    source_image = "input.jpg"
+    output_image = "output_watermarked.jpg"
+
+    # 如果当前目录下存在 input.jpg，就执行打水印逻辑
+    if os.path.exists(source_image):
+        apply_seal_watermark(source_image, output_image, opacity_percent=35, scale_percent=25)
+    else:
+        print(f"\n⚠️ 提示: 请准备一张名为 '{source_image}' 的图片放在同一目录下，以测试盖章效果。")
